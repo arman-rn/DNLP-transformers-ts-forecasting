@@ -69,3 +69,19 @@ outputs/
 logs/
 wandb/
 mlruns/
+
+# -----------------------------------------------------------------------------
+# 6. Project-specific
+# -----------------------------------------------------------------------------
+# Downloaded datasets (regenerate with data/download.py)
+data/raw/
+data/processed/
+
+# Experiment results (large files)
+results/logs/*.log
+results/figures/*.png
+results/figures/*.pdf
+
+# Temporary files
+*.tmp
+.DS_Store
