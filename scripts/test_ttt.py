@@ -72,9 +72,11 @@ def main():
           f"output={model.chronos_config.output_patch_size}")
     print(f"  Quantiles   : {model.chronos_config.quantiles}")
     total_params = sum(p.numel() for p in model.parameters())
-    emb_params = sum(p.numel() for p in model.input_patch_embedding.parameters())
-    print(f"  Total params: {total_params:,}  |  Embedding params: {emb_params:,} "
-          f"({emb_params / total_params * 100:.1f}%)")
+    out_emb_params = sum(p.numel() for p in model.output_patch_embedding.parameters())
+    in_emb_params = sum(p.numel() for p in model.input_patch_embedding.parameters())
+    print(f"  Total params: {total_params:,}")
+    print(f"  Input embedding params:  {in_emb_params:,} ({in_emb_params / total_params * 100:.1f}%)")
+    print(f"  Output embedding params: {out_emb_params:,} ({out_emb_params / total_params * 100:.1f}%)")
 
     # ---- Prepare context ----
     if args.use_etth1:
@@ -88,8 +90,8 @@ def main():
     print(f"  range=[{context.min():.4f}, {context.max():.4f}], "
           f"mean={context.mean():.4f}, std={context.std():.4f}")
 
-    # ---- Snapshot embeddings BEFORE TTT ----
-    pre_state = copy.deepcopy(model.input_patch_embedding.state_dict())
+    # ---- Snapshot output_patch_embedding BEFORE TTT ----
+    pre_state = copy.deepcopy(model.output_patch_embedding.state_dict())
 
     # ---- Run TTT ----
     print(f"\n{'='*60}")
@@ -125,7 +127,7 @@ def main():
     print(f"\n{'='*60}")
     print("Embedding reset verification")
     print(f"{'='*60}")
-    post_state = model.input_patch_embedding.state_dict()
+    post_state = model.output_patch_embedding.state_dict()
 
     all_match = True
     for key in pre_state:

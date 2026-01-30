@@ -5,7 +5,8 @@ Results are logged to wandb and saved as JSON for comparison with the baseline.
 
 Run from project root:
     python experiments/run_ttt.py
-    python experiments/run_ttt.py --n_mask 5 --ttt_steps 3 --lr 1e-4
+    python experiments/run_ttt.py --target output --n_mask 16 --lr 1e-4
+    python experiments/run_ttt.py --target output --n_mask 16 --lr 1e-4 --optimizer sgd
     python experiments/run_ttt.py --num_samples 20   # quick test
 """
 
@@ -34,18 +35,25 @@ def main():
     parser.add_argument("--config", default="configs/ttt_config.yaml")
     parser.add_argument("--num_samples", type=int, default=100,
                         help="Number of test samples to evaluate (0 = all)")
-    # TTT hyperparameter overrides (CLI takes priority over config yaml)
+    # TTT hyperparameter overrides
     parser.add_argument("--n_mask", type=int, default=None)
     parser.add_argument("--ttt_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--target", default="output",
+                        choices=["input", "output", "both"],
+                        help="Which layer(s) to adapt (default: output)")
+    parser.add_argument("--optimizer", default="adam",
+                        choices=["adam", "sgd"],
+                        help="Optimizer for TTT updates (default: adam)")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    # Resolve TTT hyperparameters: CLI overrides yaml
     n_mask = args.n_mask if args.n_mask is not None else config["ttt"]["n_mask"]
     ttt_steps = args.ttt_steps if args.ttt_steps is not None else config["ttt"]["ttt_steps"]
     lr = args.lr if args.lr is not None else config["ttt"]["lr"]
+    target = args.target
+    optim = args.optimizer
 
     model_name = config["model"]["name"]
     device = config["model"]["device"]
@@ -67,7 +75,10 @@ def main():
         torch_dtype=torch.float32,
     )
 
-    ttt_model = TTTChronos(pipeline, n_mask=n_mask, ttt_steps=ttt_steps, lr=lr)
+    ttt_model = TTTChronos(
+        pipeline, n_mask=n_mask, ttt_steps=ttt_steps, lr=lr, target=target,
+        optimizer=optim
+    )
 
     # ---- Load data ----
     print("Loading ETTh1 dataset...")
@@ -79,14 +90,16 @@ def main():
     targets = targets[:n]
     print(f"Evaluating on {n} samples (context_length={context_length}, "
           f"prediction_length={prediction_length})")
-    print(f"TTT config: n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}")
+    print(f"TTT config: target={target}, n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}, optimizer={optim}")
 
     # ---- Initialize wandb ----
     wandb.init(
         project=config["experiment"]["wandb_project"],
-        name=f"ttt_mask{n_mask}_steps{ttt_steps}",
+        name=f"ttt_{target}_{optim}_mask{n_mask}_steps{ttt_steps}",
         config={
             "method": "ttt",
+            "target": target,
+            "optimizer": optim,
             "model": model_name,
             "dataset": config["data"]["dataset"],
             "context_length": context_length,
@@ -106,23 +119,19 @@ def main():
     pbar = tqdm(
         enumerate(zip(contexts, targets)),
         total=n,
-        desc=f"TTT (mask={n_mask}, steps={ttt_steps})",
+        desc=f"TTT ({target}, mask={n_mask}, steps={ttt_steps})",
     )
     for i, (ctx, tgt) in pbar:
-        # Suppress wrapper's per-step loss prints for a clean progress bar.
-        # (Use scripts/test_ttt.py to see per-step losses for debugging.)
         with contextlib.redirect_stdout(io.StringIO()):
             forecast = ttt_model.predict(ctx, prediction_length=prediction_length)
 
-        # forecast: list with one tensor of shape (1, n_quantiles, pred_len)
-        point_forecast = forecast[0][0, MEDIAN_QUANTILE_IDX, :]  # (pred_len,)
+        point_forecast = forecast[0][0, MEDIAN_QUANTILE_IDX, :]
         m = compute_metrics(point_forecast.unsqueeze(0), tgt.unsqueeze(0))
         all_mse.append(m["mse"])
         all_mae.append(m["mae"])
 
         wandb.log({"sample_mse": m["mse"], "sample_mae": m["mae"], "sample_idx": i})
 
-        # Show running averages in the progress bar
         running_mse = sum(all_mse) / len(all_mse)
         running_mae = sum(all_mae) / len(all_mae)
         pbar.set_postfix(mse=f"{running_mse:.4f}", mae=f"{running_mae:.4f}")
@@ -132,7 +141,7 @@ def main():
     avg_mae = sum(all_mae) / len(all_mae)
 
     print(f"\n=== TTT Results ({n} samples) ===")
-    print(f"  n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}")
+    print(f"  target={target}, n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}")
     print(f"  MSE: {avg_mse:.6f}")
     print(f"  MAE: {avg_mae:.6f}")
 
@@ -173,6 +182,8 @@ def main():
 
     results = {
         "method": "ttt",
+        "target": target,
+        "optimizer": optim,
         "model": model_name,
         "dataset": config["data"]["dataset"],
         "context_length": context_length,
@@ -188,7 +199,7 @@ def main():
         "per_sample_mae": all_mae,
     }
 
-    results_path = results_dir / f"results_{n_mask}_{ttt_steps}.json"
+    results_path = results_dir / f"results_{target}_{optim}_{n_mask}_{ttt_steps}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {results_path}")
