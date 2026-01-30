@@ -2,7 +2,6 @@ import copy
 import math
 
 import torch
-import torch.nn.functional as F
 
 
 def save_embeddings(model):
@@ -31,9 +30,10 @@ def restore_embeddings(emb_layer, original_state):
 def ttt_step(model, context, n_mask, optimizer):
     """One TTT optimization step.
 
-    Splits context into practice (input) and target (last n_mask values),
-    forward passes to get median quantile prediction, computes MSE loss
-    against the masked ground truth, and updates embedding weights.
+    Splits context into practice (input) and target (last n_mask values).
+    Uses the model's built-in forward with future_target, which computes
+    quantile loss in the normalized space — matching how the model was
+    pretrained.
 
     Args:
         model: Chronos2Model instance (pipeline.model)
@@ -54,16 +54,16 @@ def ttt_step(model, context, n_mask, optimizer):
 
     optimizer.zero_grad()
 
-    # Forward pass - predict future from practice context
-    output = model(context=practice_context, num_output_patches=num_output_patches)
-    quantile_preds = output.quantile_preds  # (batch, num_quantiles, pred_length)
+    # Forward pass with future_target — the model normalizes the target
+    # with the same loc_scale as the context and computes quantile loss
+    # in that normalized space, before instance_norm.inverse().
+    output = model(
+        context=practice_context,
+        future_target=target,
+        num_output_patches=num_output_patches,
+    )
 
-    # Use median (0.5 quantile) as point prediction
-    median_idx = model.chronos_config.quantiles.index(0.5)
-    pred = quantile_preds[:, median_idx, :n_mask]
-
-    # MSE loss against ground truth
-    loss = F.mse_loss(pred, target)
+    loss = output.loss
     loss.backward()
     optimizer.step()
 

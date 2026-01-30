@@ -2,7 +2,7 @@
 ttt:
   n_mask: 3
   ttt_steps: 5
-  lr: 1.0e-3
+  lr: 1.0e-4
 
 # Model
 model:

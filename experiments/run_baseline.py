@@ -13,7 +13,7 @@ from data.dataloader import prepare_data
 from evaluation.metrics import compute_metrics
 from src.config import load_config
 
-MEDIAN_QUANTILE_IDX = 4  # Chronos-2 outputs 9 quantiles [0.1, ..., 0.9]; index 4 = 0.5
+MEDIAN_QUANTILE_IDX = 10  # Chronos-2 outputs 21 quantiles [0.01, 0.05, ..., 0.5, ..., 0.99]; index 10 = 0.5
 
 
 def main():
@@ -74,7 +74,7 @@ def main():
     # Run predictions (batch call - pipeline handles internal batching)
     print("Running predictions...")
     forecasts = pipeline.predict(contexts, prediction_length=prediction_length)
-    # forecasts: list of n tensors, each shape (1, 9, prediction_length)
+    # forecasts: list of n tensors, each shape (1, 21, prediction_length)
 
     # Compute per-sample metrics
     all_mse = []
