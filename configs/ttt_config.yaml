@@ -1,0 +1,21 @@
+# TTT Hyperparameters
+ttt:
+  n_mask: 3
+  ttt_steps: 5
+  lr: 1.0e-3
+
+# Model
+model:
+  name: "amazon/chronos-2"
+  device: "cuda"
+
+# Data
+data:
+  dataset: "ETTh1"
+  context_length: 512
+  prediction_length: 96
+
+# Experiment
+experiment:
+  seed: 42
+  wandb_project: "chronos-ttt"
