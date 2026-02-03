@@ -305,7 +305,7 @@ class Chronos2Model(PreTrainedModel):
             module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
             
         elif isinstance(module, nn.Embedding) and hasattr(self, 'stride_embedding') and module is self.stride_embedding:
-            module.weight.data.normal_(mean=0.0, std=factor * 1.0)
+            module.weight.data.normal_(mean=0.0, std=factor * 0.01)
         
         elif isinstance(module, ResidualBlock):
             module.hidden_layer.weight.data.normal_(
@@ -327,8 +327,6 @@ class Chronos2Model(PreTrainedModel):
             )
             if hasattr(module.output_layer, "bias") and module.output_layer.bias is not None:
                 module.output_layer.bias.data.zero_()
-        
-        
         
         
     def _validate_input(
@@ -432,9 +430,9 @@ class Chronos2Model(PreTrainedModel):
             
             # --- RESTORED SAFETY CHECK (Original Logic) ---
             if torch.isnan(future_covariates).any():
-                 # We can just warn or zero fill, but raising error is safer
-                 # For training stability, let's zero fill instead of crashing
-                 future_covariates = torch.nan_to_num(future_covariates, nan=0.0)
+                # We can just warn or zero fill, but raising error is safer
+                # For training stability, let's zero fill instead of crashing
+                future_covariates = torch.nan_to_num(future_covariates, nan=0.0)
 
             # Padding logic
             curr_len = future_covariates.shape[1]
@@ -486,7 +484,7 @@ class Chronos2Model(PreTrainedModel):
         # 1. Concatenate features at the end: [Batch, N, Patch, 3]
         # (Contains: Time, Value, Mask)
         patched_future = torch.cat(
-            [future_time_enc, patched_future_covariates, patched_future_covariates_mask], dim=-1
+            [patched_future_covariates, future_time_enc, patched_future_covariates_mask], dim=-1
         )
         
         # 2. PERMUTE to group by feature type: [Batch, N, 3, Patch]
@@ -597,7 +595,7 @@ class Chronos2Model(PreTrainedModel):
         patched_context = torch.where(patched_mask > 0.0, patched_context, 0.0)
 
         # Concatenate features: [Time, Value, Mask] -> mapped via residual network 
-        final_output = torch.cat([context_time_enc, patched_context, patched_mask], dim=-1)
+        final_output = torch.cat([patched_context, context_time_enc, patched_mask], dim=-1)
 
         # Permute to group by feature type before flattening: [B, N, 3, P] -> [B, N, 3*P]
         num_patches = len(patches_list)
