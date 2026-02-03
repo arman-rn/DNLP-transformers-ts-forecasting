@@ -19,7 +19,7 @@ from dataset import Chronos2Dataset
 
 # --- CONFIG ---
 SEED = 42
-MAX_STEPS = 2500        
+MAX_STEPS = 5000        
 GRAD_ACCUMULATION = 16  
 VAL_SAMPLES = 250        
 TEST_SAMPLES = 500      
@@ -35,7 +35,7 @@ MAX_GRAD_NORM = 1.0     # <--- NEW: The Speed Limit for gradients
 
 # --- PATHS ---
 LOCAL_DIR = "/tmp/kevin_chronos_run" 
-FINAL_DEST = "/mnt/share/kelezi/chronos/chronos2WOA"
+FINAL_DEST = "/mnt/share/kelezi/DNLP-transformers-ts-forecasting/finetuned_weights"
 
 def set_seed(seed):
     random.seed(seed)
@@ -62,12 +62,15 @@ def pass_through_collator(batch):
 # --- METRIC CALCULATOR ---
 def calculate_metrics(model, dataset, num_samples, desc="Eval"):
     model.eval()
-    loader = DataLoader(dataset, batch_size=1, collate_fn=pass_through_collator)
+    # Increased batch size to speed up eval; 1 is too slow!
+    loader = DataLoader(dataset, batch_size=8, collate_fn=pass_through_collator)
+    
     losses = []
     abs_errors = [] 
     sq_errors = []  
-    wql_errors = [] # <--- NEW: Track Weighted Quantile Loss
+    wql_errors = [] 
     
+    # Ensure quantiles are on the correct device
     quantiles = torch.tensor(model.chronos_config.quantiles, device="cuda", dtype=torch.float32)
     try:
         median_idx = model.chronos_config.quantiles.index(0.5)
@@ -78,17 +81,20 @@ def calculate_metrics(model, dataset, num_samples, desc="Eval"):
     
     with torch.no_grad():
         for i, batch in enumerate(loader):
-            if i >= num_samples: break
+            if i * loader.batch_size >= num_samples: break
             
             batch = {k: v.to("cuda") for k, v in batch.items()}
-            target = batch.get("target")
             
+            # --- FIXED LOGIC ---
+            target = batch.get("target")
             if target is None:
                 target = batch.get("future_target")
             if target is None:
                 target = batch.get("labels")
-            if target is None:
-                continue  
+            # -------------------
+            
+            if target is None: continue  
+
             
             outputs = model(
                 context=batch["context"],
@@ -96,31 +102,38 @@ def calculate_metrics(model, dataset, num_samples, desc="Eval"):
                 num_output_patches=REQUIRED_PATCHES,
                 future_covariates=batch.get("future_covariates")
             )
+            
+            # 1. Use the model's internal loss for consistency with training
             losses.append(outputs.loss.item())
             
-            # --- WQL CALCULATION ---
-            # quantile_preds: [Batch, Quantiles, Time] -> [1, 21, 96]
-            # target: [Batch, Time] -> [1, 96]
-            y_true = target.unsqueeze(1) # [1, 1, 96]
-            y_pred = outputs.quantile_preds # [1, 21, 96]
+            # 2. WQL Calculation (Chronos-2 Standard)
+            # target: [B, T] -> y_true: [B, 1, T]
+            # quantile_preds: [B, Q, T]
+            y_true = target.unsqueeze(1) 
+            y_pred = outputs.quantile_preds 
             
-            # Standard Quantile Loss formula: 2 * sum(q * max(y-y_hat, 0) + (1-q) * max(y_hat-y, 0)) [cite: 292]
+            # Pinball loss
             errors = y_true - y_pred
-            q_loss = torch.max(quantiles.view(1, -1, 1) * errors, (quantiles.view(1, -1, 1) - 1) * errors)
+            q_loss = torch.max(
+                quantiles.view(1, -1, 1) * errors, 
+                (quantiles.view(1, -1, 1) - 1) * errors
+            )
             
-            # Weighted by the sum of absolute targets to get WQL
-            denominator = torch.sum(torch.abs(y_true))
-            if denominator > 0:
-                wql = 2 * torch.sum(q_loss) / denominator
-                wql_errors.append(wql.item())
-            # -----------------------
+            # Weighted normalization: sum of errors / sum of absolute targets
+            # We sum over Q and T, then average over the Batch
+            sum_q_loss = torch.sum(q_loss, dim=(1, 2)) # [Batch]
+            sum_y_true = torch.sum(torch.abs(y_true), dim=(1, 2)) # [Batch]
+            
+            batch_wql = 2 * sum_q_loss / (sum_y_true + 1e-6)
+            wql_errors.extend(batch_wql.cpu().tolist())
 
+            # 3. Median Point Metrics (MAE/MSE)
             median_pred = outputs.quantile_preds[:, median_idx, :]
             min_len = min(median_pred.shape[1], target.shape[1])
-            error = median_pred[:, :min_len] - target[:, :min_len]
             
-            abs_errors.append(torch.mean(torch.abs(error)).item())
-            sq_errors.append(torch.mean(error**2).item())
+            point_error = median_pred[:, :min_len] - target[:, :min_len]
+            abs_errors.append(torch.mean(torch.abs(point_error)).item())
+            sq_errors.append(torch.mean(point_error**2).item())
 
     avg_loss = np.mean(losses)
     avg_mae = np.mean(abs_errors)
@@ -248,8 +261,8 @@ def train(sensitivity_val, output_name, description):
                 progress_bar.set_postfix({"loss": f"{running_loss / accum_steps:.4f}"})
                 
                 if current_step % 50 == 0:
-                     running_loss = 0.0
-                     accum_steps = 0
+                    running_loss = 0.0
+                    accum_steps = 0
                 
                 if current_step % EVAL_INTERVAL == 0:
                     val_loss, _, _ , _= calculate_metrics(model, val_ds, VAL_SAMPLES, desc=f"Step {current_step} Check")
@@ -293,7 +306,7 @@ if __name__ == "__main__":
     print("✅ EARLY STOPPING BENCHMARK (Fixed Tensors) ✅")
     
     s_loss, s_mae, s_mse, s_wql = train(0.0, "chronos_jena_STANDARD", "Standard Model")
-    w_loss, w_mae, w_mse_wql = train(10.0, "chronos2_PAS10", "WOA Model")
+    w_loss, w_mae, w_mse, w_wql = train(10.0, "chronos2_PAS10", "WOA Model")
     
     print("\n" + "#"*60)
     print("🏆 FINAL COMPARISON 🏆")
