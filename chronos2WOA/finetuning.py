@@ -186,10 +186,12 @@ def train(sensitivity_val, output_name, description):
     csv_path = '/mnt/share/kelezi/chronos/data/Jena/jena_climate_2009_2016.csv'
     df = pd.read_csv(csv_path)
     all_values = df['T (degC)'].values.astype(np.float32)
-    split_idx = int(len(all_values) * 0.9)
+    split_idx = int(len(all_values) * 0.8)
+    val_idx = int(len(all_values) * 0.9)
+
     train_values = all_values[:split_idx]
-    test_values = all_values[split_idx:]
-    val_values = train_values[-2200:]
+    val_values = all_values[split_idx + 2048 : val_idx]
+    test_values = all_values[val_idx + 2048 :]
     
     train_data = [{"target": torch.tensor(train_values), "past_covariates": {}, "future_covariates": {}}]
     val_data = [{"target": torch.tensor(val_values), "past_covariates": {}, "future_covariates": {}}]
@@ -298,15 +300,15 @@ def train(sensitivity_val, output_name, description):
     shutil.copytree(temp_output_path, final_network_path)
     
     # 9. TEST
-    loss, mae, mse = calculate_metrics(model, test_ds, TEST_SAMPLES, desc="FINAL TEST")
-    return loss, mae, mse
+    loss, mae, mse, wql = calculate_metrics(model, test_ds, TEST_SAMPLES, desc="FINAL TEST")
+    return loss, mae, mse, wql
 
 if __name__ == "__main__":
     os.makedirs(LOCAL_DIR, exist_ok=True)
     print("✅ EARLY STOPPING BENCHMARK (Fixed Tensors) ✅")
     
-    s_loss, s_mae, s_mse, s_wql = train(0.0, "chronos_jena_STANDARD", "Standard Model")
-    w_loss, w_mae, w_mse, w_wql = train(10.0, "chronos2_PAS10", "WOA Model")
+    s_loss, s_mae, s_mse, s_wql = train(0.0, "chronos_jena_STANDARD_scissione", "Standard Model")
+    w_loss, w_mae, w_mse, w_wql = train(10.0, "chronos2_PAS10_scissione", "WOA Model")
     
     print("\n" + "#"*60)
     print("🏆 FINAL COMPARISON 🏆")
