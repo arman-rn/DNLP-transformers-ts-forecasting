@@ -482,17 +482,15 @@ class Chronos2Model(PreTrainedModel):
 
         # --- FIX 3: RESTORE DATA ORDER (Critical) ---
         # 1. Concatenate features at the end: [Batch, N, Patch, 3]
-        # (Contains: Time, Value, Mask)
-        patched_future = torch.cat(
-            [patched_future_covariates, future_time_enc, patched_future_covariates_mask], dim=-1
-        )
+        # (Contains: Value, Time, Mask)
+        patched_future = torch.cat([future_time_enc, patched_future_covariates, patched_future_covariates_mask], dim=-1)
         
         # 2. PERMUTE to group by feature type: [Batch, N, 3, Patch]
         # This groups all Times together, all Values together, etc.
         patched_future = patched_future.permute(0, 1, 3, 2)
         
         # 3. FLATTEN: [Batch, N, 3 * Patch]
-        # Result: [Time0..Time15, Val0..Val15, Mask0..Mask15] -> MATCHES ORIGINAL!
+        # Result: [Val0..Val15, Time0..Time15, Mask0..Mask15] -> MATCHES ORIGINAL!
         patched_future = patched_future.reshape(batch_size, num_output_patches, -1)
         
         # Flatten mask for consistency if used elsewhere
@@ -595,7 +593,7 @@ class Chronos2Model(PreTrainedModel):
         patched_context = torch.where(patched_mask > 0.0, patched_context, 0.0)
 
         # Concatenate features: [Time, Value, Mask] -> mapped via residual network 
-        final_output = torch.cat([patched_context, context_time_enc, patched_mask], dim=-1)
+        final_output = torch.cat([context_time_enc, patched_context, patched_mask], dim=-1)
 
         # Permute to group by feature type before flattening: [B, N, 3, P] -> [B, N, 3*P]
         num_patches = len(patches_list)
@@ -732,11 +730,11 @@ class Chronos2Model(PreTrainedModel):
 
         # 2. GET BASE EMBEDDINGS
         # shape: (batch, num_context_patches, d_model)
-     
+
         input_embeds = self.input_patch_embedding(patched_context)
 
         # Now use the local current_strides variable
-         # Expand it to match the batch size: [Batch, NumPatches]
+        # Expand it to match the batch size: [Batch, NumPatches]
         stride_batch = current_strides.unsqueeze(0).expand(batch_size, -1)
 
         stride_embeds_context = self.stride_embedding(stride_batch)
