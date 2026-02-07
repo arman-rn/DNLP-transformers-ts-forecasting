@@ -1,12 +1,11 @@
-"""Run TTT (Test-Time Training) experiment on ETTh1.
+"""Run TTT (Test-Time Training) experiment.
 
-Loads Chronos-2 with TTT adaptation and evaluates on ETTh1 test samples.
+Loads Chronos-2 with TTT adaptation and evaluates on the chosen dataset.
 Results are logged to wandb and saved as JSON for comparison with the baseline.
 
 Run from project root:
     python experiments/run_ttt.py
-    python experiments/run_ttt.py --target output --n_mask 16 --lr 1e-4
-    python experiments/run_ttt.py --target output --n_mask 16 --lr 1e-4 --optimizer sgd
+    python experiments/run_ttt.py --dataset btc --target output --n_mask 16 --lr 1e-4 --optimizer sgd
     python experiments/run_ttt.py --num_samples 20   # quick test
 """
 
@@ -21,8 +20,7 @@ import wandb
 from tqdm import tqdm
 
 from chronos import Chronos2Pipeline
-from data.download import get_etth1
-from data.dataloader import prepare_data
+from experiments.run_baseline import load_dataset
 from evaluation.metrics import compute_metrics
 from src.config import load_config
 from src.ttt import TTTChronos
@@ -31,8 +29,13 @@ MEDIAN_QUANTILE_IDX = 10  # Chronos-2 outputs 21 quantiles [0.01, 0.05, ..., 0.5
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TTT experiment on ETTh1")
+    parser = argparse.ArgumentParser(description="TTT experiment")
     parser.add_argument("--config", default="configs/ttt_config.yaml")
+    parser.add_argument("--dataset", default="etth1",
+                        choices=["etth1", "electricity", "btc"],
+                        help="Dataset to evaluate on (default: etth1)")
+    parser.add_argument("--context_length", type=int, default=None,
+                        help="Context length override (default: from config)")
     parser.add_argument("--num_samples", type=int, default=100,
                         help="Number of test samples to evaluate (0 = all)")
     # TTT hyperparameter overrides
@@ -57,9 +60,10 @@ def main():
 
     model_name = config["model"]["name"]
     device = config["model"]["device"]
-    context_length = config["data"]["context_length"]
+    context_length = args.context_length if args.context_length is not None else config["data"]["context_length"]
     prediction_length = config["data"]["prediction_length"]
     seed = config["experiment"]["seed"]
+    dataset_name = args.dataset
 
     torch.manual_seed(seed)
 
@@ -81,27 +85,25 @@ def main():
     )
 
     # ---- Load data ----
-    print("Loading ETTh1 dataset...")
-    dataset = get_etth1()
-    contexts, targets = prepare_data(dataset, context_length, prediction_length)
+    contexts, targets = load_dataset(dataset_name, context_length, prediction_length, args.num_samples)
 
     n = len(contexts) if args.num_samples == 0 else min(args.num_samples, len(contexts))
     contexts = contexts[:n]
     targets = targets[:n]
-    print(f"Evaluating on {n} samples (context_length={context_length}, "
+    print(f"Evaluating on {n} samples (dataset={dataset_name}, context_length={context_length}, "
           f"prediction_length={prediction_length})")
     print(f"TTT config: target={target}, n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}, optimizer={optim}")
 
     # ---- Initialize wandb ----
     wandb.init(
         project=config["experiment"]["wandb_project"],
-        name=f"ttt_{target}_{optim}_mask{n_mask}_steps{ttt_steps}",
+        name=f"ttt_{dataset_name}_{target}_{optim}_mask{n_mask}_steps{ttt_steps}",
         config={
             "method": "ttt",
             "target": target,
             "optimizer": optim,
             "model": model_name,
-            "dataset": config["data"]["dataset"],
+            "dataset": dataset_name,
             "context_length": context_length,
             "prediction_length": prediction_length,
             "n_mask": n_mask,
@@ -140,7 +142,7 @@ def main():
     avg_mse = sum(all_mse) / len(all_mse)
     avg_mae = sum(all_mae) / len(all_mae)
 
-    print(f"\n=== TTT Results ({n} samples) ===")
+    print(f"\n=== TTT Results ({dataset_name}, {n} samples) ===")
     print(f"  target={target}, n_mask={n_mask}, ttt_steps={ttt_steps}, lr={lr}")
     print(f"  MSE: {avg_mse:.6f}")
     print(f"  MAE: {avg_mae:.6f}")
@@ -148,7 +150,7 @@ def main():
     wandb.log({"avg_mse": avg_mse, "avg_mae": avg_mae})
 
     # ---- Compare with baseline ----
-    baseline_path = Path("results/baseline/results.json")
+    baseline_path = Path(f"results/baseline/{dataset_name}/results.json")
     if baseline_path.exists():
         with open(baseline_path) as f:
             baseline = json.load(f)
@@ -177,7 +179,7 @@ def main():
               "Run experiments/run_baseline.py first for comparison.)")
 
     # ---- Save results ----
-    results_dir = Path("results/ttt")
+    results_dir = Path(f"results/ttt/{dataset_name}")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results = {
@@ -185,7 +187,7 @@ def main():
         "target": target,
         "optimizer": optim,
         "model": model_name,
-        "dataset": config["data"]["dataset"],
+        "dataset": dataset_name,
         "context_length": context_length,
         "prediction_length": prediction_length,
         "n_mask": n_mask,

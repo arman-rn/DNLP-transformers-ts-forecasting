@@ -1,10 +1,11 @@
-"""Run TTT hyperparameter ablation sweep on ETTh1.
+"""Run TTT hyperparameter ablation sweep.
 
 Loads Chronos-2 and data ONCE, then runs all hyperparameter combinations.
 Results are logged to wandb and saved as JSON.
 
 Run from project root:
     python experiments/run_ablations.py
+    python experiments/run_ablations.py --dataset btc
     python experiments/run_ablations.py --num_samples 20   # quick test
     python experiments/run_ablations.py --num_samples 0    # all samples
 """
@@ -21,22 +22,36 @@ import wandb
 from tqdm import tqdm
 
 from chronos import Chronos2Pipeline
-from data.download import get_etth1
-from data.dataloader import prepare_data
+from experiments.run_baseline import load_dataset
 from evaluation.metrics import compute_metrics
 from src.config import load_config
 from src.ttt import TTTChronos
 
 MEDIAN_QUANTILE_IDX = 10  # 21 quantiles; index 10 = 0.5 median
 
-# ---- Hyperparameter grid ----
-# Edit these to change the sweep
-GRID = {
-    "target": ["output"],
-    "n_mask": [16, 32],
-    "ttt_steps": [1, 2, 5],
-    "lr": [1e-5, 5e-5, 1e-4, 5e-4],
-    "optimizer": ["adam", "sgd"],
+# ---- Hyperparameter grids per dataset ----
+GRIDS = {
+    "etth1": {
+        "target": ["output"],
+        "n_mask": [16, 32],
+        "ttt_steps": [1, 2, 5],
+        "lr": [1e-5, 5e-5, 1e-4, 5e-4],
+        "optimizer": ["adam", "sgd"],
+    },
+    "electricity": {
+        "target": ["output"],
+        "n_mask": [16, 32, 48],
+        "ttt_steps": [1, 3, 5, 10],
+        "lr": [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+        "optimizer": ["sgd"],
+    },
+    "btc": {
+        "target": ["output"],
+        "n_mask": [16, 32],
+        "ttt_steps": [1, 3, 5],
+        "lr": [1e-5, 5e-5, 1e-4, 5e-4],
+        "optimizer": ["sgd"],
+    },
 }
 
 
@@ -85,8 +100,13 @@ def run_single_config(pipeline, contexts, targets, prediction_length, config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TTT ablation sweep on ETTh1")
+    parser = argparse.ArgumentParser(description="TTT ablation sweep")
     parser.add_argument("--config", default="configs/ttt_config.yaml")
+    parser.add_argument("--dataset", default="etth1",
+                        choices=["etth1", "electricity", "btc"],
+                        help="Dataset to evaluate on (default: etth1)")
+    parser.add_argument("--context_length", type=int, default=None,
+                        help="Context length override (default: from config)")
     parser.add_argument("--num_samples", type=int, default=100,
                         help="Number of test samples to evaluate (0 = all)")
     args = parser.parse_args()
@@ -95,9 +115,10 @@ def main():
 
     model_name = config["model"]["name"]
     device = config["model"]["device"]
-    context_length = config["data"]["context_length"]
+    context_length = args.context_length if args.context_length is not None else config["data"]["context_length"]
     prediction_length = config["data"]["prediction_length"]
     seed = config["experiment"]["seed"]
+    dataset_name = args.dataset
 
     torch.manual_seed(seed)
 
@@ -114,15 +135,14 @@ def main():
     )
 
     # ---- Load data ONCE ----
-    print("Loading ETTh1 dataset...")
-    dataset = get_etth1()
-    contexts, targets = prepare_data(dataset, context_length, prediction_length)
+    contexts, targets = load_dataset(dataset_name, context_length, prediction_length, args.num_samples)
 
     n = len(contexts) if args.num_samples == 0 else min(args.num_samples, len(contexts))
     contexts = contexts[:n]
     targets = targets[:n]
 
     # ---- Generate all configs ----
+    GRID = GRIDS.get(dataset_name, GRIDS["etth1"])
     all_configs = grid_configs(GRID)
     total = len(all_configs)
     print(f"\nAblation sweep: {total} configurations x {n} samples")
@@ -131,7 +151,7 @@ def main():
     # ---- Load baseline for comparison ----
     baseline_mse = None
     baseline_mae = None
-    baseline_path = Path("results/baseline/results.json")
+    baseline_path = Path(f"results/baseline/{dataset_name}/results.json")
     if baseline_path.exists():
         with open(baseline_path) as f:
             baseline = json.load(f)
@@ -142,12 +162,12 @@ def main():
     # ---- Initialize wandb for the sweep ----
     wandb.init(
         project=config["experiment"]["wandb_project"],
-        name="ablation_sweep",
+        name=f"ablation_sweep_{dataset_name}",
         config={
             "method": "ablation",
             "grid": GRID,
             "model": model_name,
-            "dataset": config["data"]["dataset"],
+            "dataset": dataset_name,
             "context_length": context_length,
             "prediction_length": prediction_length,
             "num_samples": n,
@@ -247,7 +267,7 @@ def main():
     })
 
     # ---- Save results ----
-    results_dir = Path("results/ablations")
+    results_dir = Path(f"results/ablations/{dataset_name}")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Strip per-sample lists for the summary file (keeps it small)

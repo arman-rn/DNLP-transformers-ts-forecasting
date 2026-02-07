@@ -1,4 +1,4 @@
-"""Run vanilla Chronos-2 baseline on ETTh1."""
+"""Run vanilla Chronos-2 baseline."""
 
 import argparse
 import json
@@ -8,17 +8,43 @@ import torch
 import wandb
 
 from chronos import Chronos2Pipeline
-from data.download import get_etth1
-from data.dataloader import prepare_data
+from data.download import get_etth1, get_electricity, get_btc
+from data.dataloader import prepare_etth1_data, prepare_electricity_data, prepare_btc_data
 from evaluation.metrics import compute_metrics
 from src.config import load_config
 
 MEDIAN_QUANTILE_IDX = 10  # Chronos-2 outputs 21 quantiles [0.01, 0.05, ..., 0.5, ..., 0.99]; index 10 = 0.5
 
 
+def load_dataset(dataset_name, context_length, prediction_length, num_samples):
+    """Load dataset and return (contexts, targets) lists."""
+    if dataset_name == "etth1":
+        print("Loading ETTh1 dataset...")
+        dataset = get_etth1()
+        contexts, targets = prepare_etth1_data(dataset, context_length, prediction_length)
+    elif dataset_name == "electricity":
+        print("Loading Electricity dataset...")
+        dataset = get_electricity()
+        contexts, targets = prepare_electricity_data(
+            dataset, context_length, prediction_length, num_samples
+        )
+    elif dataset_name == "btc":
+        print("Loading BTC-USD dataset...")
+        btc = get_btc()
+        contexts, targets = prepare_btc_data(btc, context_length, prediction_length, num_samples)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    return contexts, targets
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Chronos-2 baseline on ETTh1")
+    parser = argparse.ArgumentParser(description="Chronos-2 baseline")
     parser.add_argument("--config", default="configs/ttt_config.yaml")
+    parser.add_argument("--dataset", default="etth1",
+                        choices=["etth1", "electricity", "btc"],
+                        help="Dataset to evaluate on (default: etth1)")
+    parser.add_argument("--context_length", type=int, default=None,
+                        help="Context length override (default: from config)")
     parser.add_argument("--num_samples", type=int, default=100,
                         help="Number of test samples to evaluate (0 = all)")
     args = parser.parse_args()
@@ -27,9 +53,10 @@ def main():
 
     model_name = config["model"]["name"]
     device = config["model"]["device"]
-    context_length = config["data"]["context_length"]
+    context_length = args.context_length if args.context_length is not None else config["data"]["context_length"]
     prediction_length = config["data"]["prediction_length"]
     seed = config["experiment"]["seed"]
+    dataset_name = args.dataset
 
     torch.manual_seed(seed)
 
@@ -46,24 +73,22 @@ def main():
     )
 
     # Load data
-    print("Loading ETTh1 dataset...")
-    dataset = get_etth1()
-    contexts, targets = prepare_data(dataset, context_length, prediction_length)
+    contexts, targets = load_dataset(dataset_name, context_length, prediction_length, args.num_samples)
 
     n = len(contexts) if args.num_samples == 0 else min(args.num_samples, len(contexts))
     contexts = contexts[:n]
     targets = targets[:n]
-    print(f"Evaluating on {n} samples (context_length={context_length}, "
+    print(f"Evaluating on {n} samples (dataset={dataset_name}, context_length={context_length}, "
           f"prediction_length={prediction_length})")
 
     # Initialize wandb
     wandb.init(
         project=config["experiment"]["wandb_project"],
-        name="baseline",
+        name=f"baseline_{dataset_name}",
         config={
             "method": "baseline",
             "model": model_name,
-            "dataset": config["data"]["dataset"],
+            "dataset": dataset_name,
             "context_length": context_length,
             "prediction_length": prediction_length,
             "num_samples": n,
@@ -91,20 +116,20 @@ def main():
     avg_mse = sum(all_mse) / len(all_mse)
     avg_mae = sum(all_mae) / len(all_mae)
 
-    print(f"\n=== Baseline Results ({n} samples) ===")
+    print(f"\n=== Baseline Results ({dataset_name}, {n} samples) ===")
     print(f"MSE: {avg_mse:.6f}")
     print(f"MAE: {avg_mae:.6f}")
 
     wandb.log({"avg_mse": avg_mse, "avg_mae": avg_mae})
 
     # Save results
-    results_dir = Path("results/baseline")
+    results_dir = Path(f"results/baseline/{dataset_name}")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results = {
         "method": "baseline",
         "model": model_name,
-        "dataset": config["data"]["dataset"],
+        "dataset": dataset_name,
         "context_length": context_length,
         "prediction_length": prediction_length,
         "num_samples": n,
