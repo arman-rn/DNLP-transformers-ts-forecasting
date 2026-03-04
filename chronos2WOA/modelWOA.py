@@ -239,11 +239,12 @@ class Chronos2Model(PreTrainedModel):
         #               512 Columns (d_model)
         
         # Input patch embedding layer , ResidualBlock in Chronos2 works as embedding layer due to continuous values 
+        # NOTE : dimension journey --> (input dim) 3P --> (hidden dime) d_ff --> (output dim) d_model
         self.input_patch_embedding = ResidualBlock(
             # x3 for [time_embedding, patch, patch_mask]
-            in_dim=self.chronos_config.input_patch_size * 3,
+            in_dim=self.chronos_config.input_patch_size * 3,    
             h_dim=config.d_ff,
-            out_dim=config.d_model,
+            out_dim=config.d_model, 
             act_fn_name=config.dense_act_fn,
             dropout_p=config.dropout_rate,
         )
@@ -390,102 +391,9 @@ class Chronos2Model(PreTrainedModel):
                 )
     
     
-    def _prepare_patched_future(
-        self,
-        future_covariates: torch.Tensor | None,
-        future_covariates_mask: torch.Tensor | None,
-        loc_scale: tuple[torch.Tensor, torch.Tensor],
-        num_output_patches: int,
-        batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        
-        from einops import repeat, rearrange
-
-        output_patch_size = self.chronos_config.output_patch_size
-        
-        # --- FIX 1: Loc/Scale Broadcasting ---
-        loc, scale = loc_scale
-        if loc.shape[1] > 1:
-            loc = loc[:, 0:1, :]
-            scale = scale[:, 0:1, :]
-        loc_scale = (loc, scale) 
-
-        if future_covariates is not None:
-            # --- FIX 2: Handle 2D Inputs ---
-            if future_covariates.ndim == 2:
-                future_covariates = future_covariates.unsqueeze(-1)
-            
-            future_covariates, _ = self.instance_norm(future_covariates, loc_scale)
-            future_covariates = future_covariates.to(self.dtype)
-
-            if future_covariates_mask is None:
-                future_covariates_mask = torch.isnan(future_covariates).logical_not().to(future_covariates.dtype)
-            
-            if future_covariates_mask.ndim == 2:
-                future_covariates_mask = future_covariates_mask.unsqueeze(-1)
-
-            future_covariates = torch.where(future_covariates_mask > 0.0, future_covariates, 0.0)
-            
-            # --- RESTORED SAFETY CHECK (Original Logic) ---
-            if torch.isnan(future_covariates).any():
-                # We can just warn or zero fill, but raising error is safer
-                # For training stability, let's zero fill instead of crashing
-                future_covariates = torch.nan_to_num(future_covariates, nan=0.0)
-
-            # Padding logic
-            curr_len = future_covariates.shape[1]
-            needed_len = num_output_patches * output_patch_size
-            
-            if needed_len > curr_len:
-                padding = needed_len - curr_len
-                pad_shape = (batch_size, padding, future_covariates.shape[-1])
-                future_covariates = torch.cat(
-                    [future_covariates, torch.zeros(pad_shape, device=self.device, dtype=self.dtype)], dim=1
-                )
-                future_covariates_mask = torch.cat(
-                    [future_covariates_mask, torch.zeros(pad_shape, device=self.device, dtype=self.dtype)], dim=1
-                )
-
-            # Patching (Keep 3D structure [B, N, P, 1])
-            patched_future_covariates = rearrange(
-                future_covariates, "b (n p) f -> b n p f", n=num_output_patches, p=output_patch_size
-            )
-            patched_future_covariates_mask = rearrange(
-                future_covariates_mask, "b (n p) f -> b n p f", n=num_output_patches, p=output_patch_size
-            )
-        else:
-            patched_future_covariates = torch.zeros(
-                batch_size, num_output_patches, output_patch_size, 1, device=self.device, dtype=self.dtype
-            )
-            patched_future_covariates_mask = torch.zeros(
-                batch_size, num_output_patches, output_patch_size, 1, device=self.device, dtype=self.dtype
-            )
-
-        # Time Encoding
-        final_future_length = num_output_patches * output_patch_size
-        scale_val = self.chronos_config.time_encoding_scale if self.chronos_config.time_encoding_scale else self.chronos_config.context_length
-        
-        # last past patch [-(T)/C, ..., -1] and future patches [0, 1, 2, ... (T)/C]
-        future_time_enc = torch.arange(start=0, end=int(final_future_length), device=self.device, dtype=torch.float32)
-        future_time_enc = (
-            repeat(
-                future_time_enc,
-                "(n p) -> b n p 1", 
-                b=batch_size,
-                n=num_output_patches,
-                p=output_patch_size,
-            )
-            .div(scale_val)
-            .to(self.dtype)
-        )
-
-        patched_future = torch.cat([future_time_enc, patched_future_covariates, patched_future_covariates_mask], dim=-1)
-        
-        patched_future = patched_future.permute(0, 1, 3, 2)
-        patched_future = patched_future.reshape(batch_size, num_output_patches, -1)
-        patched_future_covariates_mask = patched_future_covariates_mask.reshape(batch_size, num_output_patches, -1)
-
-        return patched_future, patched_future_covariates_mask
+    
+    
+    
     
     # Input (context): A single long 1D array (e.g., 512 numbers) = [P1, P2, P3, ... P512]
     # Output (patched_context): A 2D matrix (a stack of shorter arrays).
@@ -500,8 +408,6 @@ class Chronos2Model(PreTrainedModel):
         context_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     
-        from einops import repeat 
-
         context_mask = (
             context_mask.to(context.dtype)
             if context_mask is not None
@@ -516,6 +422,7 @@ class Chronos2Model(PreTrainedModel):
 
         # scaling
         context, loc_scale = self.instance_norm(context)
+  
         
         # Handle univariate case safely by unsqueezing to [Batch, Time, 1] 
         if context.ndim == 2: context = context.unsqueeze(-1)
@@ -527,10 +434,6 @@ class Chronos2Model(PreTrainedModel):
         
         # mean and deviation standard used to scale (needed for rescaling back after prediction)
         loc, scale = loc_scale
-        if loc.ndim == 2:
-            loc = loc.unsqueeze(-1)
-            scale = scale.unsqueeze(-1)
-        loc_scale = (loc, scale)
 
         # 2. ADAPTIVE SELECTION (WOA) ------------------------------------------------------------------------------------------------------
         batch_size, context_length, _ = context.shape
@@ -541,10 +444,11 @@ class Chronos2Model(PreTrainedModel):
     
         # compute baseline volatility for adaptive braking
         # picks the score (baseline_vol) that is higher than only the bottom 20% of patches
-        std_quantile = 0.2
+        # NOTE : this value has been choosed after testing different quantiles (0.1, 0.2, 0.3) and visually inspecting the resulting patch selection on different time series.
+        std_quantile = 0.2  
         serie = context[:, :, 0] # [Batch,Time,Feature]
-        all_patches_rigid = serie.unfold(1, patch_size, 1)
-        all_stds = all_patches_rigid.std(dim=-1)
+        all_patches_rigid = serie.unfold(1, patch_size, 1) # all possible patch are created here
+        all_stds = all_patches_rigid.std(dim=-1) 
         baseline_vol = torch.quantile(all_stds, std_quantile).item()
 
         patches_list, masks_list, strides_list, absolute_offsets = [], [], [], []
@@ -600,9 +504,85 @@ class Chronos2Model(PreTrainedModel):
         attention_mask = patched_mask.sum(dim=(-2, -1)) > 0 
 
         current_strides = torch.tensor(strides_list, device=context.device, dtype=torch.long)
-        self._last_strides = current_strides # Store for visualization script
+        self._last_strides = current_strides # store for visualization script
 
         return final_output, attention_mask, loc_scale, current_strides
+    
+    def _prepare_patched_future(
+        self,
+        future_covariates: torch.Tensor | None,
+        future_covariates_mask: torch.Tensor | None,
+        loc_scale: tuple[torch.Tensor, torch.Tensor],
+        num_output_patches: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_patch_size = self.chronos_config.output_patch_size
+        if future_covariates is not None:
+        
+            future_covariates, _ = self.instance_norm(future_covariates, loc_scale)
+            future_covariates = cast(torch.Tensor, future_covariates)
+            future_covariates = future_covariates.to(self.dtype)
+
+            if future_covariates_mask is None:
+                future_covariates_mask = torch.isnan(future_covariates).logical_not().to(future_covariates.dtype)
+
+            future_covariates = torch.where(future_covariates_mask > 0.0, future_covariates, 0.0)
+                                                                                
+            if torch.isnan(future_covariates).any():
+                raise ValueError(
+                    "future_covariates contains NaN values at indices not masked by future_covariates_mask. "
+                    "Input the correct future_covariates_mask or omit it to automatically infer the mask based on NaN values."
+                )
+
+            # add padding if the length of future_covariates is not an integer multiple of output_patch_size
+            if num_output_patches * output_patch_size > future_covariates.shape[-1]:
+                padding_shape = (
+                    *future_covariates.shape[:-1],
+                    num_output_patches * output_patch_size - future_covariates.shape[-1],
+                )
+                future_covariates = torch.cat(
+                    [future_covariates, torch.zeros(padding_shape).to(future_covariates)], dim=-1
+                )
+                future_covariates_mask = torch.cat(
+                    [future_covariates_mask, torch.zeros(padding_shape).to(future_covariates_mask)], dim=-1
+                )
+
+            patched_future_covariates = rearrange(
+                future_covariates, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            )
+            patched_future_covariates_mask = rearrange(
+                future_covariates_mask, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            )
+        else:
+            patched_future_covariates = torch.zeros(
+                batch_size, num_output_patches, output_patch_size, device=self.device, dtype=self.dtype
+            )
+            patched_future_covariates_mask = torch.zeros(
+                batch_size, num_output_patches, output_patch_size, device=self.device, dtype=self.dtype
+            )
+
+        # future time encoding: every future timestep is assigned a sequential time index,
+        # scaled by model's context length = [0, 1, ..., h-1] / context_length
+        final_future_length = num_output_patches * output_patch_size
+        future_time_enc = torch.arange(start=0, end=final_future_length, device=self.device, dtype=torch.float32)
+        future_time_enc = (
+            repeat(
+                future_time_enc,
+                "(n p) -> b n p",
+                b=batch_size,
+                n=num_output_patches,
+                p=output_patch_size,
+            )
+            .div(cast(int, self.chronos_config.time_encoding_scale))
+            .to(self.dtype)
+        )
+
+        patched_future = torch.cat(
+            [future_time_enc, patched_future_covariates, patched_future_covariates_mask], dim=-1
+        )
+
+        return patched_future, patched_future_covariates_mask
+    
     
     def _compute_loss(
         self,
@@ -613,80 +593,48 @@ class Chronos2Model(PreTrainedModel):
         loc_scale: tuple[torch.Tensor, torch.Tensor],
         num_output_patches: int,
     ) -> torch.Tensor:
-        
-        from einops import rearrange
+        batch_size = future_target.shape[0]
+        output_patch_size = self.chronos_config.output_patch_size
+        assert quantile_preds.shape[0] == batch_size and quantile_preds.shape[-1] >= future_target.shape[-1]
 
-        loc, scale = loc_scale
-        if loc.shape[1] > 1:
-            loc = loc[:, 0:1, :]
-            scale = scale[:, 0:1, :]
-
-        # 2. Handle Univariate Inputs (Safe unsqueeze)
-        if future_target.ndim == 2:
-            future_target = future_target.unsqueeze(-1) #[B, T, 1]
-        
-        if future_target_mask is None:
-            future_target_mask = torch.isnan(future_target).logical_not()
-        if future_target_mask.ndim == 2:
-            future_target_mask = future_target_mask.unsqueeze(-1) #[B, T, 1]
-
-        # 3. Manual Normalization (Safe)
-        future_target = (future_target.to(self.device) - loc) / scale
-        
-
-        # 1. Align Target for Broadcasting: [B, T, 1] -> [B, 1, T]
-        # This matches quantile_preds [B, Q, T]
-        future_target = rearrange(future_target, "b t f -> b f t") 
-        future_target_mask = rearrange(future_target_mask.to(self.device), "b t f -> b f t")
-        
-        # 2. Pad Target (Original Safety Check)
-        # If predictions are longer than target, pad target with zeros
-        pred_len = quantile_preds.shape[-1]
-        tgt_len = future_target.shape[-1]
-        
-        if pred_len > tgt_len:
-            pad_len = pred_len - tgt_len
-            future_target = torch.nn.functional.pad(future_target, (0, pad_len))
-            future_target_mask = torch.nn.functional.pad(future_target_mask, (0, pad_len))
-        
-        quantiles_tensor = torch.tensor(
-            self.chronos_config.quantiles, 
-            device=self.device, 
-            dtype=self.dtype
+        # normalize target and mask
+        future_target, _ = self.instance_norm(future_target, loc_scale)
+        future_target = future_target.unsqueeze(1)
+        future_target = future_target.to(self.device)
+        future_target_mask = (
+            future_target_mask.unsqueeze(1).to(self.device)
+            if future_target_mask is not None
+            else ~torch.isnan(future_target)
         )
-        
-        # 3. Vectorized Quantile Loss (Original Formula)
-        # Calculate '2 * abs(...)' exactly like the original
-        quantiles = rearrange(quantiles_tensor, "q -> 1 q 1").to(self.device)
-        
-        # future_target is [B, 1, T], quantile_preds is [B, Q, T] -> Broadcasts to [B, Q, T]
+        future_target = torch.where(future_target_mask > 0.0, future_target, 0.0)
+
+        # pad target and target_mask if they are shorter than model's prediction
+        if quantile_preds.shape[-1] > future_target.shape[-1]:
+            padding_shape = (*future_target.shape[:-1], quantile_preds.shape[-1] - future_target.shape[-1])
+            future_target = torch.cat([future_target, torch.zeros(padding_shape).to(future_target)], dim=-1)
+            future_target_mask = torch.cat(
+                [future_target_mask, torch.zeros(padding_shape).to(future_target_mask)], dim=-1
+            )
+
+        quantiles = rearrange(self.quantiles, "num_quantiles -> 1 num_quantiles 1")
         quantile_loss = 2 * torch.abs(
             (future_target - quantile_preds) * ((future_target <= quantile_preds).float() - quantiles)
         )
-
-        # 4. COVARIATE MASKING (The logic you asked for)
-        # We need to reshape the patched mask to match the target timeline [B, 1, T]
-        # patched_future_covariates_mask comes in as [Batch, NumPatches, FlattenedDim]
-        
-        # Reshape: [B, N, P*F] -> [B, 1, T]
-        # We assume Univariate F=1, so P*F = P (16)
-        inv_future_covariate_mask = rearrange(
-            patched_future_covariates_mask, 
-            "b n p -> b 1 (n p)"
+        inv_future_covariate_mask = 1 - rearrange(
+            patched_future_covariates_mask,
+            "b n p -> b 1 (n p)",
+            b=batch_size,
+            n=num_output_patches,
+            p=output_patch_size,
         )
-        
-        # Invert it: If it's a known covariate (1), we mask it out (0) for loss.
-        # "Don't compute loss on things we already know."
-        inv_future_covariate_mask = 1.0 - inv_future_covariate_mask
-        
-        # 5. Final Mask Composition
-        # Loss is valid IF: (Target exists) AND (It is NOT a known covariate)
+        # the first components masks any missing targets and the second component masks known future values
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
-        
         loss = quantile_loss * loss_mask
-        
-        # 6. Aggregation (Mean over T, Sum over Q, Mean over B)
-        return loss.mean(dim=-1).sum(dim=-1).mean()
+        # mean over prediction horizon, sum over quantile levels and mean over batch
+        loss = loss.mean(dim=-1).sum(dim=-1).mean()
+
+        return loss
+
 
     def encode(
         self,
@@ -720,6 +668,7 @@ class Chronos2Model(PreTrainedModel):
         patched_context, attention_mask, loc_scale, current_strides = self._prepare_patched_context(
             context=context, context_mask=context_mask
         )
+        num_context_patches = attention_mask.shape[-1]
         # projecting the input patches into embedded dimension
         input_embeds = self.input_patch_embedding(patched_context) # ResidualBlock class 
     
@@ -740,7 +689,7 @@ class Chronos2Model(PreTrainedModel):
         last_patch_end = context_positions[-1] + patch_len # needed for positioning the REG token and future positions correctly 
 
         # ---------------------------------------------------------
-        # 3. Future Preparation
+        # 2. Future Preparation
         # ---------------------------------------------------------
         patched_future, patched_future_covariates_mask = self._prepare_patched_future(
             future_covariates=future_covariates,
@@ -764,7 +713,7 @@ class Chronos2Model(PreTrainedModel):
         
         
         # ---------------------------------------------------------
-        # 4. Final Assembly (Handling [REG] Token)
+        # 3. Final Assembly (Handling [REG] Token)
         # ---------------------------------------------------------
         # The order for Embeds and Position_IDs must be identical: 
         # [Context] -> [REG (Optional)] -> [Future]
@@ -805,7 +754,7 @@ class Chronos2Model(PreTrainedModel):
         # Expand positions to match batch size (that is the number of covariates)
         position_ids = combined_positions.unsqueeze(0).expand(batch_size, -1) 
         
-        
+        # posits_ids are passed here to the encoder to be used for RoPE
         # NOTE : self.encoder assigned as Chronos2Encoder class!!!!!!!!!!!!
         encoder_outputs = self.encoder(
             inputs_embeds=input_embeds,
@@ -815,7 +764,7 @@ class Chronos2Model(PreTrainedModel):
             output_attentions=output_attentions,
         )
                 
-        return encoder_outputs, loc_scale, patched_future_covariates_mask
+        return encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches
     
     def forward(
         self,
@@ -829,11 +778,74 @@ class Chronos2Model(PreTrainedModel):
         future_target_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
     ) -> Chronos2Output:
-        
-        from einops import rearrange # Ensure import
-        
-        # 1. Encode Context
-        encoder_outputs, loc_scale, patched_future_covariates_mask= self.encode(
+        """Forward pass of the Chronos2 model.
+
+        Parameters
+        ----------
+        context
+            Input tensor of shape (batch_size, context_length) containing the historical values
+        context_mask
+            Binary mask tensor of same shape as context indicating which values are valid (1) vs missing (0)
+            If missing, the context_mask will be automatically constructed based on the NaN values in context.
+        group_ids : torch.Tensor | None, optional
+            Group IDs of shape (batch_size,) indicating which times series in the batch form a group.
+            A group indicates a task, for example, for a batch of size 6:
+            - if groups_ids = [0, 1, 2, 3, 4, 5], each time series is treated independently.
+            - if groups_ids = [0, 0, 1, 1, 1, 2], information is mixed across the first two time series (id=0),
+                the next three time series (id=1) and the last time series is treated separately. Information is
+                NOT shared among time series from different groups.
+            The ordering and specific values of group_ids are not important, all time series with the same group
+            ID form a group.
+        future_covariates
+            Tensor of shape (batch_size, future_length) containing future covariates. Note that the size of
+            tensor along the first axis is equal to the batch_size. This means that future values (which may be NaNs)
+            must be provided for each time series in the batch. For any time series that need to be forecasted, the
+            future_covariates can be set to NaNs, if ``future_covariates_mask`` is omitted or to an arbitrary dummy
+            value when ``future_covariates_mask`` is provided. ``future_covariates`` can be used with ``group_ids``
+            to construct heterogenous forecasting tasks in a single batch. For example:
+            - future_covariates = [[nan, ...], [nan, ...], [v1, ...], [v2, ...], [nan, ...], [nan, ...]]
+            - groups_ids = [0, 0, 1, 1, 1, 2]
+            - future_covariates_mask = None
+            contains 3 types of forecasting tasks:
+            - [0, 0]: The first task, both future_covariates are missing, which implies that the two time series need to
+                be forecasted jointly, i.e., multivariate forecasting.
+            - [1, 1, 1]: In the next task, the first two future_covariates are available and the last one is missing
+                ([v1, ...], [v2, ...], [nan, ...]), where [v1, ...] and [v1, ...] denote an arbitrary sequence of values.
+                This indicates that the first two time series are known covariates and the third one needs to be forecasted
+                by the model.
+            - [2]: The last task has a single time series in the group which needs to be forecasted independently.
+            There is no theoretical limit on the number of time series in a group, i.e., the number of targets and known
+            covariates in a task. The above setup subsumes tasks with past-only covariates as the model's prediction for
+            those time series can simply be ignored downstream.
+        future_covariates_mask
+            Binary mask tensor of same shape as future_covariates indicating which future values are known
+            If omitted, future_covariates_mask is automatically constructed based on future_covariates with
+            all non-NaN values treated as known future values.
+        num_output_patches
+            Number of output patches to generate predictions for, by default 1
+            When ``future_covariates`` and/or ``future_target`` are provided, num_output_patches should be large enough to accommodate
+            their lengths, i.e., num_output_patches * output_patch_size >= future_length
+        future_target
+            Target tensor of shape (batch_size, future_length) used during training. If ``future_covariates`` are provided, both
+            target and future_covariates must have the same shape.
+        future_target_mask
+            Binary mask tensor of same shape as `future_target` indicating which values are valid (1) vs missing (0)
+            If missing, the `future_target_mask` will be automatically constructed based on the NaN values in `future_target`.
+        output_attentions
+            Whether to return attention weights, by default False
+
+        Returns
+        -------
+        Chronos2Output containing:
+        - loss: Training loss, if `future_target` is provided
+        - quantile_preds: Quantile predictions of shape (batch_size, num_quantiles, num_output_patches * output_patch_size).
+            quantile_preds will contain an entry for every time series in the context batch regardless of whether it was a
+            known future covariate.
+        - enc_time_self_attn_weights: Time self attention weights, if output_attentions=True
+        - enc_group_self_attn_weights: Group self attention weights, if output_attentions=True
+        """
+        batch_size = context.shape[0]
+        encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches = self.encode(
             context=context,
             context_mask=context_mask,
             group_ids=group_ids,
@@ -844,23 +856,12 @@ class Chronos2Model(PreTrainedModel):
             future_target_mask=future_target_mask,
             output_attentions=output_attentions,
         )
-        
-        # --- FIX: Slice loc_scale to Scalars [Batch, 1, 1] ---
-        # This prevents the "2048 vs 4" error in loss calculation and unscaling
-        loc, scale = loc_scale
-        if loc.shape[1] > 1:
-            loc = loc[:, 0:1, :]
-            scale = scale[:, 0:1, :]
-        loc_scale = (loc, scale) # Re-pack safe scalars
-        # -----------------------------------------------------
-
         hidden_states: torch.Tensor = encoder_outputs[0]
-        
-        # 2. Generate Predictions
-        # slice the last num_output_patches hidden states
+        assert hidden_states.shape == (batch_size, num_context_patches + 1 + num_output_patches, self.model_dim)
+
+        # slice the last num_output_patches hidden states to be input into the output_patch_embedding
         forecast_embeds = hidden_states[:, -num_output_patches:]
         quantile_preds: torch.Tensor = self.output_patch_embedding(forecast_embeds)
-        
         quantile_preds = rearrange(
             quantile_preds,
             "b n (q p) -> b q (n p)",
@@ -869,37 +870,34 @@ class Chronos2Model(PreTrainedModel):
             p=self.chronos_config.output_patch_size,
         )
 
-        # 3. Compute Loss (Now safe because we fixed loc_scale above)
         loss = (
             self._compute_loss(
                 quantile_preds=quantile_preds,
                 future_target=future_target,
                 future_target_mask=future_target_mask,
                 patched_future_covariates_mask=patched_future_covariates_mask,
-                loc_scale=loc_scale, # Passing the fixed scalar stats
+                loc_scale=loc_scale,
                 num_output_patches=num_output_patches,
             )
             if future_target is not None
             else None
         )
 
-        b, q, t = quantile_preds.shape
-        quantile_preds_flat = rearrange(quantile_preds, "b q t -> (b q) t")
-        
-        # We also need to repeat loc_scale to match B*Q
-        loc_repeated = loc.repeat_interleave(q, dim=0)
-        scale_repeated = scale.repeat_interleave(q, dim=0)
-        
-        # Handle 2D/3D mismatch in inverse()
-        # If inverse expects [Batch, Time, Features], we need to add feature dim
-        quantile_preds_flat = quantile_preds_flat.unsqueeze(-1) # [BQ, T, 1]
-        
-        # Perform Inverse
-        # Note: We use manual calculation to be 100% safe against shape errors
-        quantile_preds_flat = quantile_preds_flat * scale_repeated + loc_repeated
-        
-        # Reshape back: [BQ, T, 1] -> [B, Q, T]
-        quantile_preds = rearrange(quantile_preds_flat.squeeze(-1), "(b q) t -> b q t", b=b, q=q)
+        # Unscale predictions
+        quantile_preds = rearrange(
+            quantile_preds,
+            "b q h -> b (q h)",
+            b=batch_size,
+            q=self.num_quantiles,
+            h=num_output_patches * self.chronos_config.output_patch_size,
+        )
+        quantile_preds = self.instance_norm.inverse(quantile_preds, loc_scale)
+        quantile_preds = rearrange(
+            quantile_preds,
+            "b (q h) -> b q h",
+            q=self.num_quantiles,
+            h=num_output_patches * self.chronos_config.output_patch_size,
+        )
 
         return Chronos2Output(
             loss=loss,
