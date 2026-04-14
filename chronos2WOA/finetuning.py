@@ -47,7 +47,7 @@ BATCH_SIZE = 4 #how many sequences (of length CONTEXT_LENGHT) you want to proces
 # NOTE : in the paper notes, look how they pass from [batch, feature, time] to [batch * feature, time] when passing the data to Chronos2Dataset 
 
 # --- STABILITY CONFIG ---
-PATIENCE = 6           # Increased Patience to allow recovery
+PATIENCE = 6          
 EVAL_INTERVAL = 50
 MAX_GRAD_NORM = 1.0     # <--- NEW: The Speed Limit for gradients
 
@@ -300,11 +300,11 @@ def train(sensitivity_val, output_name, description, which='standard'):
         model.load_state_dict(torch.load(best_model_path))
     
     # 8. SAVE
-    print(f"💾 Saving final artifact to local temp: {temp_output_path}...")
+    print(f"....Saving final artifact to local temp: {temp_output_path}...")
     model.save_pretrained(temp_output_path)
     
     final_network_path = os.path.join(FINAL_DEST, f"{output_name}")
-    print(f"🚚 Moving to Network Drive: {final_network_path}...")
+    print(f"....Moving to Network Drive: {final_network_path}...")
     if os.path.exists(final_network_path): shutil.rmtree(final_network_path)
     shutil.copytree(temp_output_path, final_network_path)
     
