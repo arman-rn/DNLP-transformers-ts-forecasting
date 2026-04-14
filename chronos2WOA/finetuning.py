@@ -48,7 +48,7 @@ BATCH_SIZE = 4 #how many sequences (of length CONTEXT_LENGHT) you want to proces
 
 # --- STABILITY CONFIG ---
 PATIENCE = 6           # Increased Patience to allow recovery
-EVAL_INTERVAL = 25
+EVAL_INTERVAL = 50
 MAX_GRAD_NORM = 1.0     # <--- NEW: The Speed Limit for gradients
 
 # --- PATHS ---
@@ -70,14 +70,13 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
     median_idx = model.chronos_config.quantiles.index(0.5)
 
     print(f"evaluation of ({max_samples} samples)...")
-    
+    num_samples_processed = 0
     with torch.no_grad():
         for i, batch in enumerate(loader):
-            num_samples = i * loader.batch_size 
-            if num_samples >= max_samples: break #avoid to validate the whole validation context 
+            if num_samples_processed >= max_samples: 
+                break # avoid to validate the whole validation context #avoid to validate the whole validation context #avoid to validate the whole validation context 
             
             batch = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            
             
             context = batch.get("context")
             target = batch.get("future_target")
@@ -121,6 +120,8 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
             point_error = median_pred[:, :min_len] - target[:, :min_len]
             abs_errors.append(torch.mean(torch.abs(point_error)).item())
             sq_errors.append(torch.mean(point_error**2).item())
+
+            num_samples_processed += context.shape[0]
 
     avg_loss = np.mean(losses)
     avg_mae = np.mean(abs_errors)
@@ -249,18 +250,21 @@ def train(sensitivity_val, output_name, description, which='standard'):
                     num_output_patches=PREDICTED_PATCHES,
                     future_covariates=fut_cov
                 )
-                loss = outputs.loss / GRAD_ACCUMULATION
-            
-            scaler.scale(loss).backward()
+                loss = outputs.loss / GRAD_ACCUMULATION # scale down the loss such that the loss at GRAD_ACCUMULATION step has a magnitude similar to the non-accumulated case
+            scaler.scale(loss).backward() #computing and adding new gradients to the computational graph, not updating weights yet
             running_loss += loss.item() * GRAD_ACCUMULATION
             accum_steps += 1
             
-            # when to update weights
+            #NOTE : until now we just computed and accumulated the gradients (tiny arrows to each parameter) trough the loss, didnt update the weights yet ! 
+            # now is time to update weights, the optimization step
             if accum_steps % GRAD_ACCUMULATION == 0:
-                scaler.step(optimizer)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                
+                scaler.step(optimizer) #take the massive and accumulated gradients and update the weights accordingly
                 scaler.update()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad() #then clear the accumulated gradients 
                 
                 current_step += 1
                 current_loss = running_loss / accum_steps 
@@ -312,7 +316,7 @@ def train(sensitivity_val, output_name, description, which='standard'):
 if __name__ == "__main__":
     os.makedirs(LOCAL_DIR, exist_ok=True)
     
-    w_loss, w_mae, w_mse, w_wql = train(15, "chronos2WOA_PA754", "WOA Model", which = 'woa')
+    w_loss, w_mae, w_mse, w_wql = train(15, "chronos2WOA", "WOA Model", which = 'woa')
     s_loss, s_mae, s_mse, s_wql = train(0.0, "chronos2og", "Standard Model", which = 'standard')
     
     print(f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}")
