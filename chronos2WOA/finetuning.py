@@ -23,6 +23,7 @@ import os
 import shutil
 
 import pandas as pd
+import wandb
 
 # --- IMPORT YOUR MODULES ---
 from configWOA import Chronos2CoreConfig, Chronos2ForecastingConfig
@@ -34,6 +35,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+os.environ.setdefault("WANDB_API_KEY", "")
+if not os.environ["WANDB_API_KEY"]:
+    wandb.login()
 
 # --- CONFIG ---
 MAX_STEPS = 4000
@@ -158,6 +163,12 @@ def train(sensitivity_val, output_name, description, which="standard"):
     torch.cuda.empty_cache()
     set_seed(SEED)
 
+    wandb.init(
+        project="chronos2-woa",
+        name=output_name,
+        tags=["electricity", which],
+    )
+
     temp_output_path = os.path.join(LOCAL_DIR, output_name)
     best_model_path = os.path.join(LOCAL_DIR, f"{output_name}_BEST.pt")
 
@@ -216,6 +227,22 @@ def train(sensitivity_val, output_name, description, which="standard"):
         d_kv=64,
         dropout_rate=0.1,
         chronos_config=chronos_config_settings.__dict__,
+    )
+
+    wandb.config.update(
+        {
+            **chronos_config_settings.__dict__,
+            "MAX_STEPS": MAX_STEPS,
+            "GRAD_ACCUMULATION": GRAD_ACCUMULATION,
+            "LEARNING_RATE": LEARNING_RATE,
+            "BATCH_SIZE": BATCH_SIZE,
+            "PATIENCE": PATIENCE,
+            "EVAL_INTERVAL": EVAL_INTERVAL,
+            "MAX_GRAD_NORM": MAX_GRAD_NORM,
+            "PREDICTION_LENGTH": PREDICTION_LENGTH,
+            "CONTEXT_LENGHT": CONTEXT_LENGHT,
+            "PATCH_SIZE": PATCH_SIZE,
+        }
     )
 
     if which == "woa":
@@ -341,7 +368,9 @@ def train(sensitivity_val, output_name, description, which="standard"):
             # now is time to update weights, the optimization step
             if accum_steps % GRAD_ACCUMULATION == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), MAX_GRAD_NORM
+                )
 
                 scaler.step(
                     optimizer
@@ -354,6 +383,17 @@ def train(sensitivity_val, output_name, description, which="standard"):
                 current_loss = running_loss / accum_steps
                 progress_bar.update(1)
                 progress_bar.set_postfix({"loss": f"{current_loss:.4f}"})
+
+                wandb.log(
+                    {
+                        "train/loss": current_loss,
+                        "train/grad_norm": grad_norm.item()
+                        if isinstance(grad_norm, torch.Tensor)
+                        else grad_norm,
+                        "train/lr": scheduler.get_last_lr()[0],
+                    },
+                    step=current_step,
+                )
 
                 # stabilizing the logging (better to log every x steps instead of every step when using grad accumulation)
                 if current_step % EVAL_INTERVAL == 0:
@@ -380,7 +420,21 @@ def train(sensitivity_val, output_name, description, which="standard"):
                         if patience_counter >= PATIENCE:
                             print(" Early Stopping Triggered!")
                             stop_training = True
-                            break
+
+                    wandb.log(
+                        {
+                            "val/loss": val_loss,
+                            "val/mae": val_mae,
+                            "val/mse": val_mse,
+                            "val/wql": val_wql,
+                            "val/best_loss": best_val_loss,
+                            "val/patience": patience_counter,
+                        },
+                        step=current_step,
+                    )
+
+                    if stop_training:
+                        break
 
                     model.train()
 
@@ -403,6 +457,16 @@ def train(sensitivity_val, output_name, description, which="standard"):
     loss, mae, mse, wql = calculate_metrics(
         model, test_ds, TEST_SAMPLES, desc="FINAL TEST"
     )
+
+    wandb.log(
+        {
+            "test/loss": loss,
+            "test/mae": mae,
+            "test/mse": mse,
+            "test/wql": wql,
+        }
+    )
+    wandb.finish()
 
     return loss, mae, mse, wql
 
