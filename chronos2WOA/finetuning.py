@@ -260,26 +260,24 @@ def train(sensitivity_val, output_name, description, which="standard"):
     url = "https://raw.githubusercontent.com/laiguokun/multivariate-time-series-data/master/electricity/electricity.txt.gz"
     df = pd.read_csv(url, compression="gzip", header=None)
 
-    # first user (:,0), univariate comparison
-    prices = df.iloc[:, 0].values.astype(np.float32)
-
-    timeserie_duration = len(prices)
-    portion = (CONTEXT_LENGHT + PREDICTION_LENGTH) / timeserie_duration
-    print(
-        f"Time series length: {timeserie_duration} | Context + Prediction portion: {portion:.2%}"
-    )
-
+    n_series = df.shape[1]
+    timeserie_duration = df.shape[0]
     train_idx = int(timeserie_duration * 0.8)
     val_idx = int(timeserie_duration * 0.9)
 
-    train_vals = torch.from_numpy(prices[:train_idx])
-    val_vals = torch.from_numpy(prices[train_idx:val_idx])
-    test_vals = torch.from_numpy(prices[val_idx:])
+    portion = (CONTEXT_LENGHT + PREDICTION_LENGTH) / timeserie_duration
+    print(
+        f"Series: {n_series} | Length: {timeserie_duration} | Context + Prediction portion: {portion:.2%}"
+    )
 
-    # univariate setting
-    train_data = [{"target": train_vals}]
-    val_data = [{"target": val_vals}]
-    test_data = [{"target": test_vals}]
+    # Each column is one household; treat each as an independent univariate series.
+    # Chronos2Dataset accepts a list of {"target": ...} dicts, one per series.
+    train_data, val_data, test_data = [], [], []
+    for col_idx in range(n_series):
+        series = df.iloc[:, col_idx].values.astype(np.float32)
+        train_data.append({"target": torch.from_numpy(series[:train_idx])})
+        val_data.append({"target": torch.from_numpy(series[train_idx:val_idx])})
+        test_data.append({"target": torch.from_numpy(series[val_idx:])})
     # if we had past and future covariates it would be something like this:
     # train_data = [{"target": [train_vals], "past_covariates": past_cov_train, "future_covariates": fut_cov_train}]
 
