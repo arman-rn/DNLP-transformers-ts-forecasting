@@ -802,16 +802,14 @@ class Chronos2Model(PreTrainedModel):
 
         input_embeds = input_embeds + stride_embeds_context
 
-        # Calculate Temporal Positions (Cumulative Sum) - FOR posit_ids --> RoPe
-        # We determine the exact start time of every patch based on the variable strides
-        # if current_strides = [2,5,5,3,2,2,4,5] --> context_positions = [0,2,7,12,15,17,19,23]
-        context_positions = torch.cumsum(current_strides, dim=0) - current_strides
-
-        # retrieving the position of the REG token (it will be added later)
+        # Scale cumulative timestep positions to patch units to keep RoPE in pretrained
+        # range [0, ~64] instead of [0, ~1100]. Fractional values preserve variable-stride info.
         patch_len = self.chronos_config.input_patch_size
-        last_patch_end = (
-            context_positions[-1] + patch_len
-        )  # needed for positioning the REG token and future positions correctly
+        raw_context_positions = torch.cumsum(current_strides, dim=0) - current_strides
+        context_positions = raw_context_positions.float() / patch_len
+
+        # REG token position: end of last context patch, in patch units
+        last_patch_end = (raw_context_positions[-1] + patch_len).float() / patch_len
 
         # ---------------------------------------------------------
         # 2. Future Preparation
@@ -857,10 +855,10 @@ class Chronos2Model(PreTrainedModel):
             # B. REG Position (placed right after last context patch)
             reg_pos = last_patch_end.unsqueeze(0)
 
-            future_positions = (
-                torch.arange(num_output_patches, device=self.device) * default_stride
-            )
-            future_positions = future_positions + last_patch_end + 1
+            # future_positions in patch units: spaced by default_stride/patch_len = 1.0 per patch,
+            # starting one patch-unit after the REG token
+            future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+            future_positions = future_positions + last_patch_end + 1.0
 
             input_embeds = torch.cat([input_embeds, reg_embeds, future_embeds], dim=-2)
             combined_positions = torch.cat(
@@ -879,9 +877,7 @@ class Chronos2Model(PreTrainedModel):
                 dim=-1,
             )
         else:
-            future_positions = (
-                torch.arange(num_output_patches, device=self.device) * default_stride
-            )
+            future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
             future_positions = future_positions + last_patch_end
 
             input_embeds = torch.cat([input_embeds, future_embeds], dim=-2)
