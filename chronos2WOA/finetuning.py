@@ -158,7 +158,9 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
     return avg_loss, avg_mae, avg_mse, avg_wql
 
 
-def train(sensitivity_val, output_name, description, which="standard", uniform_stride=None):
+def train(
+    sensitivity_val, output_name, description, which="standard", uniform_stride=None
+):
     gc.collect()
     torch.cuda.empty_cache()
     set_seed(SEED)
@@ -475,10 +477,10 @@ def train(sensitivity_val, output_name, description, which="standard", uniform_s
 if __name__ == "__main__":
     os.makedirs(LOCAL_DIR, exist_ok=True)
 
-    w_loss, w_mae, w_mse, w_wql = train(15, "chronos2WOA", "WOA Model", which="woa")
-    s_loss, s_mae, s_mse, s_wql = train(
-        0.0, "chronos2og", "Standard Model", which="standard"
-    )
+    # w_loss, w_mae, w_mse, w_wql = train(15, "chronos2WOA", "WOA Model", which="woa")
+    # s_loss, s_mae, s_mse, s_wql = train(
+    #     0.0, "chronos2og", "Standard Model", which="standard"
+    # )
     u_loss, u_mae, u_mse, u_wql = train(
         0.0,
         "chronos2WOA_stride8",
@@ -487,20 +489,20 @@ if __name__ == "__main__":
         uniform_stride=8,
     )
 
-    print(
-        f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}"
-    )
-    print(
-        f"{'MAE':<10} | {s_mae:<12.4f} | {w_mae:<12.4f} | {'WOA' if w_mae < s_mae else 'Standard'}"
-    )
-    print(
-        f"{'MSE':<10} | {s_mse:<12.4f} | {w_mse:<12.4f} | {'WOA' if w_mse < s_mse else 'Standard'}"
-    )
-    print(
-        f"{'WQL':<10} | {s_wql:<12.4f} | {w_wql:<12.4f} | {'WOA' if w_wql < s_wql else 'Standard'}"
-    )
+    # print(
+    #     f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}"
+    # )
+    # print(
+    #     f"{'MAE':<10} | {s_mae:<12.4f} | {w_mae:<12.4f} | {'WOA' if w_mae < s_mae else 'Standard'}"
+    # )
+    # print(
+    #     f"{'MSE':<10} | {s_mse:<12.4f} | {w_mse:<12.4f} | {'WOA' if w_mse < s_mse else 'Standard'}"
+    # )
+    # print(
+    #     f"{'WQL':<10} | {s_wql:<12.4f} | {w_wql:<12.4f} | {'WOA' if w_wql < s_wql else 'Standard'}"
+    # )
 
-    print(f"\nUniform-stride-8 ablation final test results:")
+    print("\nUniform-stride-8 ablation final test results:")
     print(f"  Loss: {u_loss:.4f}")
     print(f"  MAE:  {u_mae:.4f}")
     print(f"  MSE:  {u_mse:.4f}")
