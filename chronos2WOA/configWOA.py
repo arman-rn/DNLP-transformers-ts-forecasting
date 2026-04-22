@@ -122,6 +122,7 @@ class Chronos2ForecastingConfig:
     input_patch_stride: int = 64
     sensitivity: float = 25.0
     min_stride: int = 1
+    uniform_stride: int | None = None  # Ablation: if set, bypass volatility and use this stride for every patch
     
     @classmethod
     def editable_fields(cls) -> list[str]:

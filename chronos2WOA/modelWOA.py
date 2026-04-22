@@ -477,21 +477,25 @@ class Chronos2Model(PreTrainedModel):
             context = context[:, -self.chronos_config.context_length :]
             context_mask = context_mask[:, -self.chronos_config.context_length :]
 
-        # ---- VOLATILITY ON RAW CONTEXT (before normalization) ----
+        uniform_stride = self.chronos_config.uniform_stride
+
         patch_size = self.chronos_config.input_patch_size
         default_stride = self.chronos_config.input_patch_stride
         sensitivity = self.chronos_config.sensitivity
         min_s = self.chronos_config.min_stride
-        std_quantile = 0.2
 
-        # Precompute per-position std for every possible patch start, on raw data.
-        # Replace NaNs with 0 just for std computation (doesn't affect patching below).
+        if uniform_stride is None:
+            # ---- VOLATILITY ON RAW CONTEXT (before normalization) ----
+            std_quantile = 0.2
 
-        raw_for_vol = torch.nan_to_num(context, nan=0.0)
-        all_patches_rigid = raw_for_vol.unfold(1, patch_size, 1)  # [B, T-P+1, P]
-        all_stds = all_patches_rigid.std(dim=-1)  # [B, T-P+1]
-        per_start_vol = all_stds.max(dim=0).values  # [T-P+1], batch-max
-        baseline_vol = torch.quantile(all_stds, std_quantile).item()
+            # Precompute per-position std for every possible patch start, on raw data.
+            # Replace NaNs with 0 just for std computation (doesn't affect patching below).
+
+            raw_for_vol = torch.nan_to_num(context, nan=0.0)
+            all_patches_rigid = raw_for_vol.unfold(1, patch_size, 1)  # [B, T-P+1, P]
+            all_stds = all_patches_rigid.std(dim=-1)  # [B, T-P+1]
+            per_start_vol = all_stds.max(dim=0).values  # [T-P+1], batch-max
+            baseline_vol = torch.quantile(all_stds, std_quantile).item()
 
         # ---- NORMALIZATION ----
         context, loc_scale = self.instance_norm(context)
@@ -509,7 +513,8 @@ class Chronos2Model(PreTrainedModel):
         batch_size, context_length, _ = context.shape
 
         # Move per-start volatility to a CPU list once — avoids .item() sync inside loop
-        per_start_vol_cpu = per_start_vol.detach().cpu().tolist()
+        if uniform_stride is None:
+            per_start_vol_cpu = per_start_vol.detach().cpu().tolist()
 
         # ---- ADAPTIVE SELECTION LOOP ----
         patches_list, masks_list, strides_list, absolute_offsets = [], [], [], []
@@ -523,10 +528,13 @@ class Chronos2Model(PreTrainedModel):
             masks_list.append(curr_mask)
             absolute_offsets.append(cursor)
 
-            local_vol = per_start_vol_cpu[cursor]
-            excess = max(0.0, local_vol - baseline_vol)
-            braking_factor = 1 + (excess * sensitivity)
-            step = int(max(min_s, round(default_stride / braking_factor)))
+            if uniform_stride is not None:
+                step = uniform_stride
+            else:
+                local_vol = per_start_vol_cpu[cursor]
+                excess = max(0.0, local_vol - baseline_vol)
+                braking_factor = 1 + (excess * sensitivity)
+                step = int(max(min_s, round(default_stride / braking_factor)))
 
             strides_list.append(step)
             cursor += step

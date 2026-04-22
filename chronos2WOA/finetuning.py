@@ -158,7 +158,7 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
     return avg_loss, avg_mae, avg_mse, avg_wql
 
 
-def train(sensitivity_val, output_name, description, which="standard"):
+def train(sensitivity_val, output_name, description, which="standard", uniform_stride=None):
     gc.collect()
     torch.cuda.empty_cache()
     set_seed(SEED)
@@ -179,6 +179,7 @@ def train(sensitivity_val, output_name, description, which="standard"):
     print(f"\n{'=' * 60}")
     print(f"🚀 STARTING STABLE RUN: {description}")
     print(f"   Sensitivity: {sensitivity_val}")
+    print(f"   Uniform Stride: {uniform_stride}")
     print(f"   Gradient Clipping: {MAX_GRAD_NORM}")
     print(f"{'=' * 60}\n")
 
@@ -217,6 +218,7 @@ def train(sensitivity_val, output_name, description, which="standard"):
         sensitivity=sensitivity_val,
         min_stride=1,
         input_patch_stride=PATCH_SIZE,
+        uniform_stride=uniform_stride,
     )
 
     config = Chronos2CoreConfig(
@@ -477,6 +479,13 @@ if __name__ == "__main__":
     s_loss, s_mae, s_mse, s_wql = train(
         0.0, "chronos2og", "Standard Model", which="standard"
     )
+    u_loss, u_mae, u_mse, u_wql = train(
+        0.0,
+        "chronos2WOA_stride8",
+        "WOA Uniform Stride 8 (overlap isolation)",
+        which="woa",
+        uniform_stride=8,
+    )
 
     print(
         f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}"
@@ -490,3 +499,9 @@ if __name__ == "__main__":
     print(
         f"{'WQL':<10} | {s_wql:<12.4f} | {w_wql:<12.4f} | {'WOA' if w_wql < s_wql else 'Standard'}"
     )
+
+    print(f"\nUniform-stride-8 ablation final test results:")
+    print(f"  Loss: {u_loss:.4f}")
+    print(f"  MAE:  {u_mae:.4f}")
+    print(f"  MSE:  {u_mse:.4f}")
+    print(f"  WQL:  {u_wql:.4f}")
