@@ -462,7 +462,7 @@ class Chronos2Model(PreTrainedModel):
     def _prepare_patched_context(
         self, context: torch.Tensor, context_mask: torch.Tensor | None = None
     ) -> tuple[
-        torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor
+        torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
     ]:
 
         context_mask = (
@@ -478,6 +478,10 @@ class Chronos2Model(PreTrainedModel):
             context_mask = context_mask[:, -self.chronos_config.context_length :]
 
         uniform_stride = self.chronos_config.uniform_stride
+        per_seq_vol = self.chronos_config.per_sequence_volatility
+        assert not (per_seq_vol and uniform_stride is not None), (
+            "per_sequence_volatility and uniform_stride are mutually exclusive"
+        )
 
         patch_size = self.chronos_config.input_patch_size
         default_stride = self.chronos_config.input_patch_stride
@@ -494,8 +498,12 @@ class Chronos2Model(PreTrainedModel):
             raw_for_vol = torch.nan_to_num(context, nan=0.0)
             all_patches_rigid = raw_for_vol.unfold(1, patch_size, 1)  # [B, T-P+1, P]
             all_stds = all_patches_rigid.std(dim=-1)  # [B, T-P+1]
-            per_start_vol = all_stds.max(dim=0).values  # [T-P+1], batch-max
-            baseline_vol = torch.quantile(all_stds, std_quantile).item()
+            if per_seq_vol:
+                per_start_vol_per_seq = all_stds  # [B, T-P+1]
+                baseline_vol_per_seq = torch.quantile(all_stds, std_quantile, dim=1)  # [B]
+            else:
+                per_start_vol = all_stds.max(dim=0).values  # [T-P+1], batch-max
+                baseline_vol = torch.quantile(all_stds, std_quantile).item()
 
         # ---- NORMALIZATION ----
         context, loc_scale = self.instance_norm(context)
@@ -513,63 +521,173 @@ class Chronos2Model(PreTrainedModel):
         batch_size, context_length, _ = context.shape
 
         # Move per-start volatility to a CPU list once — avoids .item() sync inside loop
-        if uniform_stride is None:
+        if per_seq_vol:
+            per_start_vol_cpu_per_seq = per_start_vol_per_seq.detach().cpu().tolist()  # list of B lists
+            baseline_vol_cpu_per_seq = baseline_vol_per_seq.detach().cpu().tolist()    # list of B floats
+        elif uniform_stride is None:
             per_start_vol_cpu = per_start_vol.detach().cpu().tolist()
 
         # ---- ADAPTIVE SELECTION LOOP ----
-        patches_list, masks_list, strides_list, absolute_offsets = [], [], [], []
-        cursor = 0
+        if per_seq_vol:
+            # Per-sequence adaptive loop: each sequence gets its own stride schedule
+            per_seq_patches = []        # list of B tensors, each [N_b, P, 1]
+            per_seq_masks = []          # list of B tensors, each [N_b, P, 1]
+            per_seq_strides = []        # list of B lists, each length N_b
+            per_seq_offsets = []        # list of B lists, each length N_b
 
-        while cursor + patch_size <= context_length:
-            curr_patch = context[:, cursor : cursor + patch_size, :]
-            curr_mask = context_mask[:, cursor : cursor + patch_size, :]
+            for b in range(batch_size):
+                seq_vol = per_start_vol_cpu_per_seq[b]
+                seq_baseline = baseline_vol_cpu_per_seq[b]
 
-            patches_list.append(curr_patch)
-            masks_list.append(curr_mask)
-            absolute_offsets.append(cursor)
+                seq_patches_list = []
+                seq_masks_list = []
+                seq_strides_list = []
+                seq_offsets = []
+                cursor = 0
 
-            if uniform_stride is not None:
-                step = uniform_stride
-            else:
-                local_vol = per_start_vol_cpu[cursor]
-                excess = max(0.0, local_vol - baseline_vol)
-                braking_factor = 1 + (excess * sensitivity)
-                step = int(max(min_s, round(default_stride / braking_factor)))
+                while cursor + patch_size <= context_length:
+                    curr_patch = context[b, cursor : cursor + patch_size, :]   # [P, 1]
+                    curr_mask = context_mask[b, cursor : cursor + patch_size, :]  # [P, 1]
 
-            strides_list.append(step)
-            cursor += step
+                    seq_patches_list.append(curr_patch)
+                    seq_masks_list.append(curr_mask)
+                    seq_offsets.append(cursor)
+
+                    local_vol = seq_vol[cursor]
+                    excess = max(0.0, local_vol - seq_baseline)
+                    braking_factor = 1 + (excess * sensitivity)
+                    step = int(max(min_s, round(default_stride / braking_factor)))
+
+                    seq_strides_list.append(step)
+                    cursor += step
+
+                # Stack this sequence's patches: [N_b, P, 1]
+                per_seq_patches.append(torch.stack(seq_patches_list, dim=0))
+                per_seq_masks.append(torch.stack(seq_masks_list, dim=0))
+                per_seq_strides.append(seq_strides_list)
+                per_seq_offsets.append(seq_offsets)
+
+            real_last_patch_end = torch.tensor(
+                [
+                    (per_seq_offsets[b][-1] + patch_size) / patch_size
+                    if per_seq_offsets[b] else 1.0
+                    for b in range(batch_size)
+                ],
+                device=context.device, dtype=torch.float32,
+            )  # [B]
+
+            # Determine padding target
+            N_max = max(len(s) for s in per_seq_strides)
+
+            # Zero-pad each sequence's patches and masks to N_max along the patch dimension
+            padded_patches = []
+            padded_masks = []
+            padded_strides = []
+            padded_offsets = []
+            for b in range(batch_size):
+                n_b = per_seq_patches[b].shape[0]
+                pad_count = N_max - n_b
+
+                if pad_count > 0:
+                    zero_patch_pad = torch.zeros(
+                        pad_count, patch_size, per_seq_patches[b].shape[-1],
+                        dtype=per_seq_patches[b].dtype, device=context.device,
+                    )
+                    zero_mask_pad = torch.zeros(
+                        pad_count, patch_size, per_seq_masks[b].shape[-1],
+                        dtype=per_seq_masks[b].dtype, device=context.device,
+                    )
+                    padded_patches.append(torch.cat([per_seq_patches[b], zero_patch_pad], dim=0))
+                    padded_masks.append(torch.cat([per_seq_masks[b], zero_mask_pad], dim=0))
+                    # Pad strides with default_stride (will be masked out anyway, but safer than 0)
+                    padded_strides.append(per_seq_strides[b] + [default_stride] * pad_count)
+                    # Pad offsets with the last real offset (will be masked out)
+                    last_offset = per_seq_offsets[b][-1] if per_seq_offsets[b] else 0
+                    padded_offsets.append(per_seq_offsets[b] + [last_offset] * pad_count)
+                else:
+                    padded_patches.append(per_seq_patches[b])
+                    padded_masks.append(per_seq_masks[b])
+                    padded_strides.append(per_seq_strides[b])
+                    padded_offsets.append(per_seq_offsets[b])
+
+            # Stack into batched tensors: [B, N_max, P, 1]
+            patched_context = torch.stack(padded_patches, dim=0)
+            patched_mask = torch.stack(padded_masks, dim=0)
+        else:
+            patches_list, masks_list, strides_list, absolute_offsets = [], [], [], []
+            cursor = 0
+
+            while cursor + patch_size <= context_length:
+                curr_patch = context[:, cursor : cursor + patch_size, :]
+                curr_mask = context_mask[:, cursor : cursor + patch_size, :]
+
+                patches_list.append(curr_patch)
+                masks_list.append(curr_mask)
+                absolute_offsets.append(cursor)
+
+                if uniform_stride is not None:
+                    step = uniform_stride
+                else:
+                    local_vol = per_start_vol_cpu[cursor]
+                    excess = max(0.0, local_vol - baseline_vol)
+                    braking_factor = 1 + (excess * sensitivity)
+                    step = int(max(min_s, round(default_stride / braking_factor)))
+
+                strides_list.append(step)
+                cursor += step
+
+            real_last_patch_end = torch.tensor(
+                (absolute_offsets[-1] + patch_size) / patch_size,
+                device=context.device, dtype=torch.float32,
+            )  # 0-dim scalar
         # ------------------------------------------------------------------------------------------------------------------------------------
         # 3. NON-DISTORTED TIME ENCODING (we need to encode the true time position of each patch without distortion to preserve temporal information for the model)
         max_supported_len = (
             self.chronos_config.time_encoding_scale
             or self.chronos_config.context_length
         )
-        time_enc_patches = []
-        # retrieve for each adapted patch the time he is referring to
-        for offset in absolute_offsets:
-            # j = [-(T)/C, ..., 0]
-            patch_time = torch.arange(
-                offset, offset + patch_size, device=context.device
-            )  # [0, 1, 2, 3]
-            subtracted_patch = (
-                patch_time - context_length
-            )  # [-100, -99, -98, -97] points in the past will have negative values
-            patch_time = (
-                subtracted_patch / max_supported_len
-            )  # [-1.0, -0.99, -0.98, -0.97] squashes those numbers into a small range
-            time_enc_patches.append(patch_time)
+        if per_seq_vol:
+            # Build per-sequence time encoding [B, N_max, P, 1]
+            time_enc_per_seq = []
+            for b in range(batch_size):
+                seq_time_patches = []
+                for offset in padded_offsets[b]:
+                    patch_time = torch.arange(offset, offset + patch_size, device=context.device)
+                    patch_time = (patch_time - context_length) / max_supported_len
+                    seq_time_patches.append(patch_time)
+                time_enc_per_seq.append(torch.stack(seq_time_patches, dim=0))  # [N_max, P]
+            context_time_enc = torch.stack(time_enc_per_seq, dim=0).unsqueeze(-1).to(self.dtype)  # [B, N_max, P, 1]
+        else:
+            time_enc_patches = []
+            # retrieve for each adapted patch the time he is referring to
+            for offset in absolute_offsets:
+                # j = [-(T)/C, ..., 0]
+                patch_time = torch.arange(
+                    offset, offset + patch_size, device=context.device
+                )  # [0, 1, 2, 3]
+                subtracted_patch = (
+                    patch_time - context_length
+                )  # [-100, -99, -98, -97] points in the past will have negative values
+                patch_time = (
+                    subtracted_patch / max_supported_len
+                )  # [-1.0, -0.99, -0.98, -0.97] squashes those numbers into a small range
+                time_enc_patches.append(patch_time)
 
-        # [Batch, NumPatches, PatchSize, 1] tensor
-        context_time_enc = (
-            torch.stack(time_enc_patches, dim=0).unsqueeze(0).unsqueeze(-1)
-        )
-        context_time_enc = context_time_enc.expand(batch_size, -1, -1, -1).to(
-            self.dtype
-        )
+            # [Batch, NumPatches, PatchSize, 1] tensor
+            context_time_enc = (
+                torch.stack(time_enc_patches, dim=0).unsqueeze(0).unsqueeze(-1)
+            )
+            context_time_enc = context_time_enc.expand(batch_size, -1, -1, -1).to(
+                self.dtype
+            )
         # ------------------------------------------------------------------------------------------------------------------------------------
         # 4. FINAL ASSEMBLY
-        patched_context = torch.stack(patches_list, dim=1)
-        patched_mask = torch.stack(masks_list, dim=1)
+        if per_seq_vol:
+            # patched_context and patched_mask already stacked above
+            pass
+        else:
+            patched_context = torch.stack(patches_list, dim=1)
+            patched_mask = torch.stack(masks_list, dim=1)
         patched_mask = torch.nan_to_num(patched_mask, nan=0.0)
         patched_context = torch.where(patched_mask > 0.0, patched_context, 0.0)
 
@@ -579,7 +697,7 @@ class Chronos2Model(PreTrainedModel):
         )
 
         # Permute to group by feature type before flattening: [B, N, 3, P] -> [B, N, 3*P]
-        num_patches = len(patches_list)
+        num_patches = N_max if per_seq_vol else len(patches_list)
         final_output = final_output.permute(0, 1, 3, 2).reshape(
             batch_size, num_patches, -1
         )
@@ -587,12 +705,17 @@ class Chronos2Model(PreTrainedModel):
         # Binary mask indicating if a patch is valid [cite: 231]
         attention_mask = patched_mask.sum(dim=(-2, -1)) > 0
 
-        current_strides = torch.tensor(
-            strides_list, device=context.device, dtype=torch.long
-        )
+        if per_seq_vol:
+            current_strides = torch.tensor(
+                padded_strides, device=context.device, dtype=torch.long
+            )  # [B, N_max]
+        else:
+            current_strides = torch.tensor(
+                strides_list, device=context.device, dtype=torch.long
+            )  # [N]
         self._last_strides = current_strides  # store for visualization script
 
-        return final_output, attention_mask, loc_scale, current_strides
+        return final_output, attention_mask, loc_scale, current_strides, real_last_patch_end
 
     def _prepare_patched_future(
         self,
@@ -794,7 +917,7 @@ class Chronos2Model(PreTrainedModel):
         # ---------------------------------------------------------
         # 1. Context Preparation (PA Logic)
         # ---------------------------------------------------------
-        patched_context, attention_mask, loc_scale, current_strides = (
+        patched_context, attention_mask, loc_scale, current_strides, real_last_patch_end = (
             self._prepare_patched_context(context=context, context_mask=context_mask)
         )
         num_context_patches = attention_mask.shape[-1]
@@ -805,7 +928,10 @@ class Chronos2Model(PreTrainedModel):
 
         # the strides are projected into the same embedding space as the input patches
         # and then added to the input embeddings to inject stride information into the model
-        stride_batch = current_strides.unsqueeze(0).expand(batch_size, -1)
+        if current_strides.ndim == 1:
+            stride_batch = current_strides.unsqueeze(0).expand(batch_size, -1)
+        else:
+            stride_batch = current_strides  # already [B, N_max]
         stride_embeds_context = self.stride_embedding(stride_batch)
 
         input_embeds = input_embeds + stride_embeds_context
@@ -813,11 +939,14 @@ class Chronos2Model(PreTrainedModel):
         # Scale cumulative timestep positions to patch units to keep RoPE in pretrained
         # range [0, ~64] instead of [0, ~1100]. Fractional values preserve variable-stride info.
         patch_len = self.chronos_config.input_patch_size
-        raw_context_positions = torch.cumsum(current_strides, dim=0) - current_strides
-        context_positions = raw_context_positions.float() / patch_len
-
-        # REG token position: end of last context patch, in patch units
-        last_patch_end = (raw_context_positions[-1] + patch_len).float() / patch_len
+        if current_strides.ndim == 1:
+            raw_context_positions = torch.cumsum(current_strides, dim=0) - current_strides  # [N]
+            context_positions = raw_context_positions.float() / patch_len  # [N]
+            last_patch_end = real_last_patch_end  # scalar (0-dim)
+        else:
+            raw_context_positions = torch.cumsum(current_strides, dim=1) - current_strides  # [B, N_max]
+            context_positions = raw_context_positions.float() / patch_len  # [B, N_max]
+            last_patch_end = real_last_patch_end  # [B]
 
         # ---------------------------------------------------------
         # 2. Future Preparation
@@ -861,17 +990,24 @@ class Chronos2Model(PreTrainedModel):
             reg_embeds = self.shared(reg_input_ids)
 
             # B. REG Position (placed right after last context patch)
-            reg_pos = last_patch_end.unsqueeze(0)
-
-            # future_positions in patch units: spaced by default_stride/patch_len = 1.0 per patch,
-            # starting one patch-unit after the REG token
-            future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
-            future_positions = future_positions + last_patch_end + 1.0
+            if current_strides.ndim == 1:
+                reg_pos = last_patch_end.unsqueeze(0)  # [1]
+                # future_positions in patch units: spaced by default_stride/patch_len = 1.0 per patch,
+                # starting one patch-unit after the REG token
+                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+                future_positions = future_positions + last_patch_end + 1.0  # [num_output_patches]
+                combined_positions = torch.cat(
+                    [context_positions, reg_pos, future_positions], dim=0
+                )  # [N + 1 + num_output_patches]
+            else:
+                reg_pos = last_patch_end.unsqueeze(-1)  # [B, 1]
+                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+                future_positions = future_positions.unsqueeze(0) + last_patch_end.unsqueeze(-1) + 1.0  # [B, num_output_patches]
+                combined_positions = torch.cat(
+                    [context_positions, reg_pos, future_positions], dim=1
+                )  # [B, N_max + 1 + num_output_patches]
 
             input_embeds = torch.cat([input_embeds, reg_embeds, future_embeds], dim=-2)
-            combined_positions = torch.cat(
-                [context_positions, reg_pos, future_positions], dim=0
-            )
 
             reg_mask = torch.ones(
                 (batch_size, 1), device=self.device, dtype=attention_mask.dtype
@@ -885,11 +1021,16 @@ class Chronos2Model(PreTrainedModel):
                 dim=-1,
             )
         else:
-            future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
-            future_positions = future_positions + last_patch_end
+            if current_strides.ndim == 1:
+                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+                future_positions = future_positions + last_patch_end
+                combined_positions = torch.cat([context_positions, future_positions], dim=0)
+            else:
+                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+                future_positions = future_positions.unsqueeze(0) + last_patch_end.unsqueeze(-1)  # [B, num_output_patches]
+                combined_positions = torch.cat([context_positions, future_positions], dim=1)
 
             input_embeds = torch.cat([input_embeds, future_embeds], dim=-2)
-            combined_positions = torch.cat([context_positions, future_positions], dim=0)
 
             attention_mask = torch.cat(
                 [attention_mask.to(self.dtype), future_attention_mask.to(self.dtype)],
@@ -902,8 +1043,12 @@ class Chronos2Model(PreTrainedModel):
         if group_ids is None:
             group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
 
-        # Expand positions to match batch size (that is the number of covariates)
-        position_ids = combined_positions.unsqueeze(0).expand(batch_size, -1)
+        # Expand positions to match batch size (that is the number of covariates).
+        # If combined_positions is already [B, total] (per-sequence path), use directly.
+        if combined_positions.ndim == 1:
+            position_ids = combined_positions.unsqueeze(0).expand(batch_size, -1)
+        else:
+            position_ids = combined_positions
 
         # posits_ids are passed here to the encoder to be used for RoPE
         # NOTE : self.encoder assigned as Chronos2Encoder class!!!!!!!!!!!!

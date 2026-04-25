@@ -159,7 +159,7 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
 
 
 def train(
-    sensitivity_val, output_name, description, which="standard", uniform_stride=None
+    sensitivity_val, output_name, description, which="standard", uniform_stride=None, per_sequence_volatility=False
 ):
     gc.collect()
     torch.cuda.empty_cache()
@@ -182,6 +182,7 @@ def train(
     print(f"🚀 STARTING STABLE RUN: {description}")
     print(f"   Sensitivity: {sensitivity_val}")
     print(f"   Uniform Stride: {uniform_stride}")
+    print(f"   Per-Sequence Volatility: {per_sequence_volatility}")
     print(f"   Gradient Clipping: {MAX_GRAD_NORM}")
     print(f"{'=' * 60}\n")
 
@@ -221,6 +222,7 @@ def train(
         min_stride=1,
         input_patch_stride=PATCH_SIZE,
         uniform_stride=uniform_stride,
+        per_sequence_volatility=per_sequence_volatility,
     )
 
     config = Chronos2CoreConfig(
@@ -489,6 +491,14 @@ if __name__ == "__main__":
         uniform_stride=8,
     )
 
+    p_loss, p_mae, p_mse, p_wql = train(
+        15,
+        "chronos2WOA_perseq",
+        "WOA Per-Sequence Volatility (leak fix)",
+        which="woa",
+        per_sequence_volatility=True,
+    )
+
     # print(
     #     f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}"
     # )
@@ -507,3 +517,9 @@ if __name__ == "__main__":
     print(f"  MAE:  {u_mae:.4f}")
     print(f"  MSE:  {u_mse:.4f}")
     print(f"  WQL:  {u_wql:.4f}")
+
+    print(f"\nPer-sequence volatility ablation final test results:")
+    print(f"  Loss: {p_loss:.4f}")
+    print(f"  MAE:  {p_mae:.4f}")
+    print(f"  MSE:  {p_mse:.4f}")
+    print(f"  WQL:  {p_wql:.4f}")
