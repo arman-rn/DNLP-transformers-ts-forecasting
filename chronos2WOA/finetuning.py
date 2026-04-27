@@ -159,7 +159,7 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
 
 
 def train(
-    sensitivity_val, output_name, description, which="standard", uniform_stride=None, per_sequence_volatility=False
+    sensitivity_val, output_name, description, which="standard", uniform_stride=None, per_sequence_volatility=False, use_rezero_stride=False
 ):
     gc.collect()
     torch.cuda.empty_cache()
@@ -183,6 +183,7 @@ def train(
     print(f"   Sensitivity: {sensitivity_val}")
     print(f"   Uniform Stride: {uniform_stride}")
     print(f"   Per-Sequence Volatility: {per_sequence_volatility}")
+    print(f"   ReZero gating: {use_rezero_stride}")
     print(f"   Gradient Clipping: {MAX_GRAD_NORM}")
     print(f"{'=' * 60}\n")
 
@@ -223,6 +224,7 @@ def train(
         input_patch_stride=PATCH_SIZE,
         uniform_stride=uniform_stride,
         per_sequence_volatility=per_sequence_volatility,
+        use_rezero_stride=use_rezero_stride,
     )
 
     config = Chronos2CoreConfig(
@@ -497,6 +499,15 @@ if __name__ == "__main__":
         "WOA Per-Sequence Volatility (leak fix)",
         which="woa",
         per_sequence_volatility=True,
+    )
+
+    r_loss, r_mae, r_mse, r_wql = train(
+        15,
+        "chronos2WOA_rezero",
+        "E5: per-seq + ReZero gating on stride embedding",
+        which="woa",
+        per_sequence_volatility=True,
+        use_rezero_stride=True,
     )
 
     # print(

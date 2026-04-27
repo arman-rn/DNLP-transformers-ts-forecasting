@@ -255,6 +255,11 @@ class Chronos2Model(PreTrainedModel):
             embedding_dim=config.d_model,
         )
 
+        if self.chronos_config.use_rezero_stride:
+            self.stride_alpha = nn.Parameter(torch.zeros(1))
+        else:
+            self.stride_alpha = None
+
         # self.stride_embedding.weight = [
         #     [ 0.01, -0.02,  0.005, ...,   0.012 ],  <- Row 0: Represents Stride 0 (usually unused)
         #     [ -0.01, 0.003, -0.015, ..., -0.004 ],  <- Row 1: Represents Stride 1
@@ -933,6 +938,8 @@ class Chronos2Model(PreTrainedModel):
         else:
             stride_batch = current_strides  # already [B, N_max]
         stride_embeds_context = self.stride_embedding(stride_batch)
+        if self.stride_alpha is not None:
+            stride_embeds_context = self.stride_alpha * stride_embeds_context
 
         input_embeds = input_embeds + stride_embeds_context
 
@@ -974,6 +981,8 @@ class Chronos2Model(PreTrainedModel):
             device=self.device,
         )
         stride_embeds_future = self.stride_embedding(future_strides)
+        if self.stride_alpha is not None:
+            stride_embeds_future = self.stride_alpha * stride_embeds_future
         future_embeds = future_embeds + stride_embeds_future
 
         # ---------------------------------------------------------

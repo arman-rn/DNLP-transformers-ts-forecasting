@@ -124,6 +124,7 @@ class Chronos2ForecastingConfig:
     min_stride: int = 1
     uniform_stride: int | None = None  # Ablation: if set, bypass volatility and use this stride for every patch
     per_sequence_volatility: bool = False  # If True, compute volatility per-sequence and pad to max length per batch
+    use_rezero_stride: bool = False  # If True, gate stride_embedding with a learnable scalar alpha (init 0)
     
     @classmethod
     def editable_fields(cls) -> list[str]:
