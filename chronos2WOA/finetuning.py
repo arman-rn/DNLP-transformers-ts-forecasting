@@ -159,7 +159,14 @@ def calculate_metrics(model, dataset, max_samples, desc="Eval"):
 
 
 def train(
-    sensitivity_val, output_name, description, which="standard", uniform_stride=None, per_sequence_volatility=False, use_rezero_stride=False
+    sensitivity_val,
+    output_name,
+    description,
+    which="standard",
+    uniform_stride=None,
+    per_sequence_volatility=False,
+    use_rezero_stride=False,
+    coverage_lambda=0.0,
 ):
     gc.collect()
     torch.cuda.empty_cache()
@@ -184,6 +191,7 @@ def train(
     print(f"   Uniform Stride: {uniform_stride}")
     print(f"   Per-Sequence Volatility: {per_sequence_volatility}")
     print(f"   ReZero gating: {use_rezero_stride}")
+    print(f"   Coverage lambda: {coverage_lambda}")
     print(f"   Gradient Clipping: {MAX_GRAD_NORM}")
     print(f"{'=' * 60}\n")
 
@@ -225,6 +233,7 @@ def train(
         uniform_stride=uniform_stride,
         per_sequence_volatility=per_sequence_volatility,
         use_rezero_stride=use_rezero_stride,
+        coverage_lambda=coverage_lambda,
     )
 
     config = Chronos2CoreConfig(
@@ -333,6 +342,7 @@ def train(
     current_step = 0
     accum_steps = 0
     running_loss = 0.0
+    running_coverage = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     stop_training = False
@@ -368,6 +378,11 @@ def train(
                 loss
             ).backward()  # computing and adding new gradients to the computational graph, not updating weights yet
             running_loss += loss.item() * GRAD_ACCUMULATION
+            running_coverage += (
+                outputs.coverage_penalty.item()
+                if outputs.coverage_penalty is not None
+                else 0.0
+            )
             accum_steps += 1
 
             # NOTE : until now we just computed and accumulated the gradients (tiny arrows to each parameter) trough the loss, didnt update the weights yet !
@@ -387,12 +402,14 @@ def train(
 
                 current_step += 1
                 current_loss = running_loss / accum_steps
+                current_coverage = running_coverage / accum_steps
                 progress_bar.update(1)
                 progress_bar.set_postfix({"loss": f"{current_loss:.4f}"})
 
                 wandb.log(
                     {
                         "train/loss": current_loss,
+                        "train/coverage_penalty": current_coverage,
                         "train/grad_norm": grad_norm.item()
                         if isinstance(grad_norm, torch.Tensor)
                         else grad_norm,
@@ -404,6 +421,7 @@ def train(
                 # stabilizing the logging (better to log every x steps instead of every step when using grad accumulation)
                 if current_step % EVAL_INTERVAL == 0:
                     running_loss = 0.0
+                    running_coverage = 0.0
                     accum_steps = 0
 
                     val_loss, val_mae, val_mse, val_wql = calculate_metrics(
@@ -510,6 +528,15 @@ if __name__ == "__main__":
         use_rezero_stride=True,
     )
 
+    c_loss, c_mae, c_mse, c_wql = train(
+        15,
+        "chronos2WOA_coverage",
+        "per-seq + coverage-calibrated loss",
+        which="woa",
+        per_sequence_volatility=True,
+        coverage_lambda=0.1,
+    )
+
     # print(
     #     f"{'Loss':<10} | {s_loss:<12.4f} | {w_loss:<12.4f} | {'WOA' if w_loss < s_loss else 'Standard'}"
     # )
@@ -529,7 +556,7 @@ if __name__ == "__main__":
     print(f"  MSE:  {u_mse:.4f}")
     print(f"  WQL:  {u_wql:.4f}")
 
-    print(f"\nPer-sequence volatility ablation final test results:")
+    print("\nPer-sequence volatility ablation final test results:")
     print(f"  Loss: {p_loss:.4f}")
     print(f"  MAE:  {p_mae:.4f}")
     print(f"  MSE:  {p_mse:.4f}")

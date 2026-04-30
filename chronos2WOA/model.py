@@ -203,6 +203,7 @@ class Chronos2Encoder(nn.Module):
 class Chronos2Output(ModelOutput):
     loss: torch.Tensor | None = None
     quantile_preds: torch.Tensor | None = None
+    coverage_penalty: torch.Tensor | None = None
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
 
@@ -516,7 +517,7 @@ class Chronos2Model(PreTrainedModel):
         patched_future_covariates_mask: torch.Tensor,
         loc_scale: tuple[torch.Tensor, torch.Tensor],
         num_output_patches: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
         assert quantile_preds.shape[0] == batch_size and quantile_preds.shape[-1] >= future_target.shape[-1]
@@ -557,7 +558,22 @@ class Chronos2Model(PreTrainedModel):
         # mean over prediction horizon, sum over quantile levels and mean over batch
         loss = loss.mean(dim=-1).sum(dim=-1).mean()
 
-        return loss
+        # Coverage-calibration penalty (scalar). Sigmoid surrogate of indicator(y <= y_hat) keeps
+        # the gradient flowing; beta=20 gives a sharp-but-smooth transition in normalized residual
+        # space (instance_norm makes residuals roughly O(1)). Empirical coverage is the mask-weighted
+        # mean over (B, T) per quantile; penalty = sum_q (cov_q - q)^2 — same scalar reduction as the
+        # pinball term so coverage_lambda has predictable scale relative to it.
+        coverage_lambda = self.chronos_config.coverage_lambda
+        beta = 20.0
+        soft_indicator = torch.sigmoid(beta * (quantile_preds - future_target))
+        denom = loss_mask.sum().clamp(min=1.0)
+        empirical_coverage = (soft_indicator * loss_mask).sum(dim=(0, 2)) / denom
+        target_coverage = self.quantiles.to(empirical_coverage)
+        coverage_penalty = ((empirical_coverage - target_coverage) ** 2).sum()
+
+        total_loss = loss + coverage_lambda * coverage_penalty
+
+        return total_loss, coverage_penalty
 
     def encode(
         self,
@@ -731,8 +747,8 @@ class Chronos2Model(PreTrainedModel):
             p=self.chronos_config.output_patch_size,
         )
 
-        loss = (
-            self._compute_loss(
+        if future_target is not None:
+            loss, coverage_penalty = self._compute_loss(
                 quantile_preds=quantile_preds,
                 future_target=future_target,
                 future_target_mask=future_target_mask,
@@ -740,9 +756,8 @@ class Chronos2Model(PreTrainedModel):
                 loc_scale=loc_scale,
                 num_output_patches=num_output_patches,
             )
-            if future_target is not None
-            else None
-        )
+        else:
+            loss, coverage_penalty = None, None
 
         # Unscale predictions
         quantile_preds = rearrange(
@@ -763,6 +778,7 @@ class Chronos2Model(PreTrainedModel):
         return Chronos2Output(
             loss=loss,
             quantile_preds=quantile_preds,
+            coverage_penalty=coverage_penalty,
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
         )

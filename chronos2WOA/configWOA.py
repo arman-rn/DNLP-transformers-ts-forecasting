@@ -117,6 +117,7 @@ class Chronos2ForecastingConfig:
     use_arcsinh: bool = False
     max_output_patches: int = 1
     time_encoding_scale: int | None = None
+    coverage_lambda: float = 0.0  # weight on coverage-calibration penalty added to pinball loss; 0.0 = baseline behavior
     
     # --- 2. WOA Adaptive Fields ---
     input_patch_stride: int = 64
