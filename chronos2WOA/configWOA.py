@@ -118,7 +118,8 @@ class Chronos2ForecastingConfig:
     max_output_patches: int = 1
     time_encoding_scale: int | None = None
     coverage_lambda: float = 0.0  # weight on coverage-calibration penalty added to pinball loss; 0.0 = baseline behavior
-    
+    volatility_weighting: bool = False  # If True, weight per-series pinball contribution by normalized context volatility
+
     # --- 2. WOA Adaptive Fields ---
     input_patch_stride: int = 64
     sensitivity: float = 25.0

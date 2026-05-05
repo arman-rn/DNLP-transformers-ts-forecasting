@@ -211,6 +211,7 @@ class Chronos2Encoder(nn.Module):
 class Chronos2Output(ModelOutput):
     loss: torch.Tensor | None = None
     quantile_preds: torch.Tensor | None = None
+    quantile_preds_normalized: torch.Tensor | None = None
     coverage_penalty: torch.Tensor | None = None
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
@@ -468,7 +469,12 @@ class Chronos2Model(PreTrainedModel):
     def _prepare_patched_context(
         self, context: torch.Tensor, context_mask: torch.Tensor | None = None
     ) -> tuple[
-        torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
 
         context_mask = (
@@ -494,19 +500,21 @@ class Chronos2Model(PreTrainedModel):
         sensitivity = self.chronos_config.sensitivity
         min_s = self.chronos_config.min_stride
 
+        # ---- VOLATILITY ON RAW CONTEXT (before normalization) ----
+        # Always computed: per_series_vol feeds the optional volatility-weighted loss in _compute_loss,
+        # and (when uniform_stride is None) all_stds drives the adaptive stride loop below.
+        raw_for_vol = torch.nan_to_num(context, nan=0.0)
+        all_patches_rigid = raw_for_vol.unfold(1, patch_size, 1)  # [B, T-P+1, P]
+        all_stds = all_patches_rigid.std(dim=-1)  # [B, T-P+1]
+        per_series_vol = all_stds.mean(dim=1)  # [B]
+
         if uniform_stride is None:
-            # ---- VOLATILITY ON RAW CONTEXT (before normalization) ----
             std_quantile = 0.2
-
-            # Precompute per-position std for every possible patch start, on raw data.
-            # Replace NaNs with 0 just for std computation (doesn't affect patching below).
-
-            raw_for_vol = torch.nan_to_num(context, nan=0.0)
-            all_patches_rigid = raw_for_vol.unfold(1, patch_size, 1)  # [B, T-P+1, P]
-            all_stds = all_patches_rigid.std(dim=-1)  # [B, T-P+1]
             if per_seq_vol:
                 per_start_vol_per_seq = all_stds  # [B, T-P+1]
-                baseline_vol_per_seq = torch.quantile(all_stds, std_quantile, dim=1)  # [B]
+                baseline_vol_per_seq = torch.quantile(
+                    all_stds, std_quantile, dim=1
+                )  # [B]
             else:
                 per_start_vol = all_stds.max(dim=0).values  # [T-P+1], batch-max
                 baseline_vol = torch.quantile(all_stds, std_quantile).item()
@@ -528,18 +536,22 @@ class Chronos2Model(PreTrainedModel):
 
         # Move per-start volatility to a CPU list once — avoids .item() sync inside loop
         if per_seq_vol:
-            per_start_vol_cpu_per_seq = per_start_vol_per_seq.detach().cpu().tolist()  # list of B lists
-            baseline_vol_cpu_per_seq = baseline_vol_per_seq.detach().cpu().tolist()    # list of B floats
+            per_start_vol_cpu_per_seq = (
+                per_start_vol_per_seq.detach().cpu().tolist()
+            )  # list of B lists
+            baseline_vol_cpu_per_seq = (
+                baseline_vol_per_seq.detach().cpu().tolist()
+            )  # list of B floats
         elif uniform_stride is None:
             per_start_vol_cpu = per_start_vol.detach().cpu().tolist()
 
         # ---- ADAPTIVE SELECTION LOOP ----
         if per_seq_vol:
             # Per-sequence adaptive loop: each sequence gets its own stride schedule
-            per_seq_patches = []        # list of B tensors, each [N_b, P, 1]
-            per_seq_masks = []          # list of B tensors, each [N_b, P, 1]
-            per_seq_strides = []        # list of B lists, each length N_b
-            per_seq_offsets = []        # list of B lists, each length N_b
+            per_seq_patches = []  # list of B tensors, each [N_b, P, 1]
+            per_seq_masks = []  # list of B tensors, each [N_b, P, 1]
+            per_seq_strides = []  # list of B lists, each length N_b
+            per_seq_offsets = []  # list of B lists, each length N_b
 
             for b in range(batch_size):
                 seq_vol = per_start_vol_cpu_per_seq[b]
@@ -552,8 +564,10 @@ class Chronos2Model(PreTrainedModel):
                 cursor = 0
 
                 while cursor + patch_size <= context_length:
-                    curr_patch = context[b, cursor : cursor + patch_size, :]   # [P, 1]
-                    curr_mask = context_mask[b, cursor : cursor + patch_size, :]  # [P, 1]
+                    curr_patch = context[b, cursor : cursor + patch_size, :]  # [P, 1]
+                    curr_mask = context_mask[
+                        b, cursor : cursor + patch_size, :
+                    ]  # [P, 1]
 
                     seq_patches_list.append(curr_patch)
                     seq_masks_list.append(curr_mask)
@@ -576,10 +590,12 @@ class Chronos2Model(PreTrainedModel):
             real_last_patch_end = torch.tensor(
                 [
                     (per_seq_offsets[b][-1] + patch_size) / patch_size
-                    if per_seq_offsets[b] else 1.0
+                    if per_seq_offsets[b]
+                    else 1.0
                     for b in range(batch_size)
                 ],
-                device=context.device, dtype=torch.float32,
+                device=context.device,
+                dtype=torch.float32,
             )  # [B]
 
             # Determine padding target
@@ -596,20 +612,34 @@ class Chronos2Model(PreTrainedModel):
 
                 if pad_count > 0:
                     zero_patch_pad = torch.zeros(
-                        pad_count, patch_size, per_seq_patches[b].shape[-1],
-                        dtype=per_seq_patches[b].dtype, device=context.device,
+                        pad_count,
+                        patch_size,
+                        per_seq_patches[b].shape[-1],
+                        dtype=per_seq_patches[b].dtype,
+                        device=context.device,
                     )
                     zero_mask_pad = torch.zeros(
-                        pad_count, patch_size, per_seq_masks[b].shape[-1],
-                        dtype=per_seq_masks[b].dtype, device=context.device,
+                        pad_count,
+                        patch_size,
+                        per_seq_masks[b].shape[-1],
+                        dtype=per_seq_masks[b].dtype,
+                        device=context.device,
                     )
-                    padded_patches.append(torch.cat([per_seq_patches[b], zero_patch_pad], dim=0))
-                    padded_masks.append(torch.cat([per_seq_masks[b], zero_mask_pad], dim=0))
+                    padded_patches.append(
+                        torch.cat([per_seq_patches[b], zero_patch_pad], dim=0)
+                    )
+                    padded_masks.append(
+                        torch.cat([per_seq_masks[b], zero_mask_pad], dim=0)
+                    )
                     # Pad strides with default_stride (will be masked out anyway, but safer than 0)
-                    padded_strides.append(per_seq_strides[b] + [default_stride] * pad_count)
+                    padded_strides.append(
+                        per_seq_strides[b] + [default_stride] * pad_count
+                    )
                     # Pad offsets with the last real offset (will be masked out)
                     last_offset = per_seq_offsets[b][-1] if per_seq_offsets[b] else 0
-                    padded_offsets.append(per_seq_offsets[b] + [last_offset] * pad_count)
+                    padded_offsets.append(
+                        per_seq_offsets[b] + [last_offset] * pad_count
+                    )
                 else:
                     padded_patches.append(per_seq_patches[b])
                     padded_masks.append(per_seq_masks[b])
@@ -644,7 +674,8 @@ class Chronos2Model(PreTrainedModel):
 
             real_last_patch_end = torch.tensor(
                 (absolute_offsets[-1] + patch_size) / patch_size,
-                device=context.device, dtype=torch.float32,
+                device=context.device,
+                dtype=torch.float32,
             )  # 0-dim scalar
         # ------------------------------------------------------------------------------------------------------------------------------------
         # 3. NON-DISTORTED TIME ENCODING (we need to encode the true time position of each patch without distortion to preserve temporal information for the model)
@@ -658,11 +689,17 @@ class Chronos2Model(PreTrainedModel):
             for b in range(batch_size):
                 seq_time_patches = []
                 for offset in padded_offsets[b]:
-                    patch_time = torch.arange(offset, offset + patch_size, device=context.device)
+                    patch_time = torch.arange(
+                        offset, offset + patch_size, device=context.device
+                    )
                     patch_time = (patch_time - context_length) / max_supported_len
                     seq_time_patches.append(patch_time)
-                time_enc_per_seq.append(torch.stack(seq_time_patches, dim=0))  # [N_max, P]
-            context_time_enc = torch.stack(time_enc_per_seq, dim=0).unsqueeze(-1).to(self.dtype)  # [B, N_max, P, 1]
+                time_enc_per_seq.append(
+                    torch.stack(seq_time_patches, dim=0)
+                )  # [N_max, P]
+            context_time_enc = (
+                torch.stack(time_enc_per_seq, dim=0).unsqueeze(-1).to(self.dtype)
+            )  # [B, N_max, P, 1]
         else:
             time_enc_patches = []
             # retrieve for each adapted patch the time he is referring to
@@ -721,7 +758,14 @@ class Chronos2Model(PreTrainedModel):
             )  # [N]
         self._last_strides = current_strides  # store for visualization script
 
-        return final_output, attention_mask, loc_scale, current_strides, real_last_patch_end
+        return (
+            final_output,
+            attention_mask,
+            loc_scale,
+            current_strides,
+            real_last_patch_end,
+            per_series_vol,
+        )
 
     def _prepare_patched_future(
         self,
@@ -841,6 +885,7 @@ class Chronos2Model(PreTrainedModel):
         patched_future_covariates_mask: torch.Tensor,
         loc_scale: tuple[torch.Tensor, torch.Tensor],
         num_output_patches: int,
+        per_series_vol: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
@@ -889,8 +934,16 @@ class Chronos2Model(PreTrainedModel):
         # the first components masks any missing targets and the second component masks known future values
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
         loss = quantile_loss * loss_mask
-        # mean over prediction horizon, sum over quantile levels and mean over batch
-        loss = loss.mean(dim=-1).sum(dim=-1).mean()
+
+        # Reduce: mean over horizon, sum over quantiles, then either uniform or volatility-weighted mean over batch.
+        # Weights normalized so they average to ~1.0 → loss magnitude (and LR/coverage_lambda calibration) is preserved.
+        if self.chronos_config.volatility_weighting:
+            per_series_loss = loss.mean(dim=-1).sum(dim=-1)  # [B]
+            vol = per_series_vol.to(per_series_loss)
+            weights = vol / (vol.mean() + 1e-8)
+            loss = (per_series_loss * weights).mean()
+        else:
+            loss = loss.mean(dim=-1).sum(dim=-1).mean()
 
         # Coverage-calibration penalty (scalar). Sigmoid surrogate of indicator(y <= y_hat) keeps
         # the gradient flowing; beta=20 gives a sharp-but-smooth transition in normalized residual
@@ -941,9 +994,14 @@ class Chronos2Model(PreTrainedModel):
         # ---------------------------------------------------------
         # 1. Context Preparation (PA Logic)
         # ---------------------------------------------------------
-        patched_context, attention_mask, loc_scale, current_strides, real_last_patch_end = (
-            self._prepare_patched_context(context=context, context_mask=context_mask)
-        )
+        (
+            patched_context,
+            attention_mask,
+            loc_scale,
+            current_strides,
+            real_last_patch_end,
+            per_series_vol,
+        ) = self._prepare_patched_context(context=context, context_mask=context_mask)
         num_context_patches = attention_mask.shape[-1]
         # projecting the input patches into embedded dimension
         input_embeds = self.input_patch_embedding(
@@ -966,11 +1024,15 @@ class Chronos2Model(PreTrainedModel):
         # range [0, ~64] instead of [0, ~1100]. Fractional values preserve variable-stride info.
         patch_len = self.chronos_config.input_patch_size
         if current_strides.ndim == 1:
-            raw_context_positions = torch.cumsum(current_strides, dim=0) - current_strides  # [N]
+            raw_context_positions = (
+                torch.cumsum(current_strides, dim=0) - current_strides
+            )  # [N]
             context_positions = raw_context_positions.float() / patch_len  # [N]
             last_patch_end = real_last_patch_end  # scalar (0-dim)
         else:
-            raw_context_positions = torch.cumsum(current_strides, dim=1) - current_strides  # [B, N_max]
+            raw_context_positions = (
+                torch.cumsum(current_strides, dim=1) - current_strides
+            )  # [B, N_max]
             context_positions = raw_context_positions.float() / patch_len  # [B, N_max]
             last_patch_end = real_last_patch_end  # [B]
 
@@ -1022,15 +1084,23 @@ class Chronos2Model(PreTrainedModel):
                 reg_pos = last_patch_end.unsqueeze(0)  # [1]
                 # future_positions in patch units: spaced by default_stride/patch_len = 1.0 per patch,
                 # starting one patch-unit after the REG token
-                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
-                future_positions = future_positions + last_patch_end + 1.0  # [num_output_patches]
+                future_positions = torch.arange(
+                    num_output_patches, device=self.device
+                ).float() * (default_stride / patch_len)
+                future_positions = (
+                    future_positions + last_patch_end + 1.0
+                )  # [num_output_patches]
                 combined_positions = torch.cat(
                     [context_positions, reg_pos, future_positions], dim=0
                 )  # [N + 1 + num_output_patches]
             else:
                 reg_pos = last_patch_end.unsqueeze(-1)  # [B, 1]
-                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
-                future_positions = future_positions.unsqueeze(0) + last_patch_end.unsqueeze(-1) + 1.0  # [B, num_output_patches]
+                future_positions = torch.arange(
+                    num_output_patches, device=self.device
+                ).float() * (default_stride / patch_len)
+                future_positions = (
+                    future_positions.unsqueeze(0) + last_patch_end.unsqueeze(-1) + 1.0
+                )  # [B, num_output_patches]
                 combined_positions = torch.cat(
                     [context_positions, reg_pos, future_positions], dim=1
                 )  # [B, N_max + 1 + num_output_patches]
@@ -1050,13 +1120,23 @@ class Chronos2Model(PreTrainedModel):
             )
         else:
             if current_strides.ndim == 1:
-                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
+                future_positions = torch.arange(
+                    num_output_patches, device=self.device
+                ).float() * (default_stride / patch_len)
                 future_positions = future_positions + last_patch_end
-                combined_positions = torch.cat([context_positions, future_positions], dim=0)
+                combined_positions = torch.cat(
+                    [context_positions, future_positions], dim=0
+                )
             else:
-                future_positions = torch.arange(num_output_patches, device=self.device).float() * (default_stride / patch_len)
-                future_positions = future_positions.unsqueeze(0) + last_patch_end.unsqueeze(-1)  # [B, num_output_patches]
-                combined_positions = torch.cat([context_positions, future_positions], dim=1)
+                future_positions = torch.arange(
+                    num_output_patches, device=self.device
+                ).float() * (default_stride / patch_len)
+                future_positions = future_positions.unsqueeze(
+                    0
+                ) + last_patch_end.unsqueeze(-1)  # [B, num_output_patches]
+                combined_positions = torch.cat(
+                    [context_positions, future_positions], dim=1
+                )
 
             input_embeds = torch.cat([input_embeds, future_embeds], dim=-2)
 
@@ -1093,6 +1173,7 @@ class Chronos2Model(PreTrainedModel):
             loc_scale,
             patched_future_covariates_mask,
             num_context_patches,
+            per_series_vol,
         )
 
     def forward(
@@ -1179,6 +1260,7 @@ class Chronos2Model(PreTrainedModel):
             loc_scale,
             patched_future_covariates_mask,
             num_context_patches,
+            per_series_vol,
         ) = self.encode(
             context=context,
             context_mask=context_mask,
@@ -1217,9 +1299,14 @@ class Chronos2Model(PreTrainedModel):
                 patched_future_covariates_mask=patched_future_covariates_mask,
                 loc_scale=loc_scale,
                 num_output_patches=num_output_patches,
+                per_series_vol=per_series_vol,
             )
         else:
             loss, coverage_penalty = None, None
+
+        # Snapshot normalized predictions before instance_norm.inverse for adaptive-uniform distillation.
+        # Cloned so downstream rearrange/inverse can't alias-mutate the saved tensor; autograd graph stays intact.
+        quantile_preds_normalized = quantile_preds.clone()
 
         # Unscale predictions
         quantile_preds = rearrange(
@@ -1240,6 +1327,7 @@ class Chronos2Model(PreTrainedModel):
         return Chronos2Output(
             loss=loss,
             quantile_preds=quantile_preds,
+            quantile_preds_normalized=quantile_preds_normalized,
             coverage_penalty=coverage_penalty,
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,

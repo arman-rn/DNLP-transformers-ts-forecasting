@@ -167,6 +167,8 @@ def train(
     per_sequence_volatility=False,
     use_rezero_stride=False,
     coverage_lambda=0.0,
+    volatility_weighting=False,
+    distill_lambda=0.0,
 ):
     gc.collect()
     torch.cuda.empty_cache()
@@ -192,6 +194,8 @@ def train(
     print(f"   Per-Sequence Volatility: {per_sequence_volatility}")
     print(f"   ReZero gating: {use_rezero_stride}")
     print(f"   Coverage lambda: {coverage_lambda}")
+    print(f"   Volatility weighting: {volatility_weighting}")
+    print(f"   Distill lambda: {distill_lambda} (>0 → ~2× per-step time)")
     print(f"   Gradient Clipping: {MAX_GRAD_NORM}")
     print(f"{'=' * 60}\n")
 
@@ -234,6 +238,7 @@ def train(
         per_sequence_volatility=per_sequence_volatility,
         use_rezero_stride=use_rezero_stride,
         coverage_lambda=coverage_lambda,
+        volatility_weighting=volatility_weighting,
     )
 
     config = Chronos2CoreConfig(
@@ -259,6 +264,7 @@ def train(
             "PREDICTION_LENGTH": PREDICTION_LENGTH,
             "CONTEXT_LENGHT": CONTEXT_LENGHT,
             "PATCH_SIZE": PATCH_SIZE,
+            "distill_lambda": distill_lambda,
         }
     )
 
@@ -343,6 +349,7 @@ def train(
     accum_steps = 0
     running_loss = 0.0
     running_coverage = 0.0
+    running_distill = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     stop_training = False
@@ -363,7 +370,7 @@ def train(
             target = batch.get("future_target")
             fut_cov = batch.get("future_covariates")
 
-            # forward pass
+            # forward pass (student / adaptive)
             with torch.amp.autocast("cuda"):
                 outputs = model(
                     context=context,
@@ -371,8 +378,45 @@ def train(
                     num_output_patches=PREDICTED_PATCHES,
                     future_covariates=fut_cov,
                 )
+
+                # adaptive-uniform self-distillation: second forward with stride forced uniform,
+                # acts as a soft anchor toward pretrained behavior. Costs ~2× per-step time when active.
+                if distill_lambda > 0.0:
+                    saved_uniform = model.chronos_config.uniform_stride
+                    saved_per_seq = model.chronos_config.per_sequence_volatility
+                    model.chronos_config.uniform_stride = (
+                        model.chronos_config.input_patch_size
+                    )
+                    model.chronos_config.per_sequence_volatility = False
+                    try:
+                        with torch.no_grad():
+                            teacher_outputs = model(
+                                context=context,
+                                future_target=target,
+                                num_output_patches=PREDICTED_PATCHES,
+                                future_covariates=fut_cov,
+                            )
+                    finally:
+                        model.chronos_config.uniform_stride = saved_uniform
+                        model.chronos_config.per_sequence_volatility = saved_per_seq
+
+                    # L2 in normalized space → invariant to dataset scale.
+                    distill_term = (
+                        (
+                            outputs.quantile_preds_normalized
+                            - teacher_outputs.quantile_preds_normalized
+                        )
+                        ** 2
+                    ).mean()
+                    total_loss = outputs.loss + distill_lambda * distill_term
+                else:
+                    distill_term = torch.zeros(
+                        (), device=outputs.loss.device, dtype=outputs.loss.dtype
+                    )
+                    total_loss = outputs.loss
+
                 loss = (
-                    outputs.loss / GRAD_ACCUMULATION
+                    total_loss / GRAD_ACCUMULATION
                 )  # scale down the loss such that the loss at GRAD_ACCUMULATION step has a magnitude similar to the non-accumulated case
             scaler.scale(
                 loss
@@ -383,6 +427,7 @@ def train(
                 if outputs.coverage_penalty is not None
                 else 0.0
             )
+            running_distill += distill_term.item() if distill_term is not None else 0.0
             accum_steps += 1
 
             # NOTE : until now we just computed and accumulated the gradients (tiny arrows to each parameter) trough the loss, didnt update the weights yet !
@@ -403,6 +448,7 @@ def train(
                 current_step += 1
                 current_loss = running_loss / accum_steps
                 current_coverage = running_coverage / accum_steps
+                current_distill = running_distill / accum_steps
                 progress_bar.update(1)
                 progress_bar.set_postfix({"loss": f"{current_loss:.4f}"})
 
@@ -410,6 +456,8 @@ def train(
                     {
                         "train/loss": current_loss,
                         "train/coverage_penalty": current_coverage,
+                        "train/distill_loss": current_distill,
+                        "train/volatility_weight_used": float(volatility_weighting),
                         "train/grad_norm": grad_norm.item()
                         if isinstance(grad_norm, torch.Tensor)
                         else grad_norm,
@@ -422,6 +470,7 @@ def train(
                 if current_step % EVAL_INTERVAL == 0:
                     running_loss = 0.0
                     running_coverage = 0.0
+                    running_distill = 0.0
                     accum_steps = 0
 
                     val_loss, val_mae, val_mse, val_wql = calculate_metrics(
@@ -535,6 +584,35 @@ if __name__ == "__main__":
         which="woa",
         per_sequence_volatility=True,
         coverage_lambda=0.1,
+    )
+
+    # WOA + volatility-weighted loss
+    v_loss, v_mae, v_mse, v_wql = train(
+        15,
+        "chronos2WOA_volw",
+        "per-seq + volatility-weighted loss",
+        which="woa",
+        per_sequence_volatility=True,
+        volatility_weighting=True,
+    )
+
+    # WOA + adaptive-uniform self-distillation
+    d_loss, d_mae, d_mse, d_wql = train(
+        15,
+        "chronos2WOA_distill",
+        "per-seq + adaptive-uniform distillation",
+        which="woa",
+        per_sequence_volatility=True,
+        distill_lambda=1.0,
+    )
+
+    # Standard + volatility-weighted loss (for attribution vs WOA+volw)
+    s_loss, s_mae, s_mse, s_wql = train(
+        0,
+        "chronos2_std_volw",
+        "standard + volatility-weighted loss",
+        which="standard",
+        volatility_weighting=True,
     )
 
     # print(
