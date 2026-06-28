@@ -20,7 +20,7 @@ We modify the tokenization front-end of **Chronos-2** so that patch stride adapt
 │   ├── configWOA.py         # configuration schema
 │   ├── model.py             # vanilla Chronos-2 model
 │   └── dataset.py           # data loading & patching
-├── schema.png               # PA pipeline diagram (Fig. 1 of the report)
+├── pawoa.png               # PA pipeline diagram (Fig. 1 of the report)
 ├── requirements.txt
 └── README.md
 ```
