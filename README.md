@@ -95,7 +95,7 @@ All variants share the adaptive patching core (`λ = 15`, `min_stride = 1`, `P =
 | Precision              | bfloat16 (autocast forward) |
 | Random seed            | `1738`                      |
 
-Every model — vanilla and PA — uses this exact schedule, so any reported delta is attributable to the patching mechanism alone.
+Every model, vanilla and PA, uses this exact schedule, so any reported delta is attributable to the patching mechanism alone.
 
 ---
 
