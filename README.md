@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="schema.png" alt="Volatility-Aware Patch Adaptation Pipeline" width="100%">
+</p>
+
 # Adaptive Tokenization in Time Series Foundation Models via Volatility-Aware Patching
 
 University project · **DNLP** (Deep Natural Language Processing) · **Politecnico di Torino**, M.Sc. Data Science and Engineering · A.Y. 2025/26.
 
-We modify the tokenization front-end of **Chronos-2** so that patch stride adapts to local volatility, leaving the pretrained encoder weights untouched. The full four-stage pipeline is summarized in [`schema.pdf`](./schema.pdf).
+We modify the tokenization front-end of **Chronos-2** so that patch stride adapts to local volatility, leaving the pretrained encoder weights untouched. The four-stage pipeline is summarized in the figure above.
 
 ---
 
@@ -16,7 +20,7 @@ We modify the tokenization front-end of **Chronos-2** so that patch stride adapt
 │   ├── configWOA.py         # configuration schema
 │   ├── model.py             # vanilla Chronos-2 model
 │   └── dataset.py           # data loading & patching
-├── schema.pdf               # PA pipeline diagram (Fig. 1 of the report)
+├── schema.png               # PA pipeline diagram (Fig. 1 of the report)
 ├── requirements.txt
 └── README.md
 ```
@@ -97,14 +101,14 @@ Every model — vanilla and PA — uses this exact schedule, so any reported del
 
 ## Expected Results — Electricity
 
-| Chronos-2     | MAE ↓    | MSE ↓   | WQL ↓    |
-|---------------|----------|---------|----------|
-| Standard      | **4.45** | 67.41   | 37.49    |
-| Per-Seq       | 4.83     | 64.48   | 36.13    |
+| Chronos-2     | MAE ↓    | MSE ↓     | WQL ↓     |
+|---------------|----------|-----------|-----------|
+| Standard      | **4.45** | 67.41     | 37.49     |
+| Per-Seq       | 4.83     | 64.48     | 36.13     |
 | ReZero        | 4.74     | **61.73** | **35.63** |
-| Coverage      | 4.82     | 64.39   | 36.01    |
-| Vol-Weight    | 4.82     | 63.59   | 36.15    |
-| Distillation  | 4.84     | 64.51   | 36.05    |
+| Coverage      | 4.82     | 64.39     | 36.01     |
+| Vol-Weight    | 4.82     | 63.59     | 36.15     |
+| Distillation  | 4.84     | 64.51     | 36.05     |
 
 Variations of ±1 % across reruns are expected (CUDA non-determinism). ReZero achieves the best balance: lowest MSE and WQL with the smallest MAE regression.
 
