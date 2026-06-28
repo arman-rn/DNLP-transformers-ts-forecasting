@@ -4,7 +4,7 @@
 
 # Adaptive Tokenization in Time Series Foundation Models via Volatility-Aware Patching
 
-University project · **DNLP** (Deep Natural Language Processing) · **Politecnico di Torino**, M.Sc. Data Science and Engineering · A.Y. 2025/26.
+**PoliTo** · **DNLP** (Deep Natural Language Processing) · M.Sc. Data Science and Engineering · A.Y. 2025/26.
 
 We modify the tokenization front-end of **Chronos-2** so that patch stride adapts to local volatility, leaving the pretrained encoder weights untouched. The four-stage pipeline is summarized in the figure above.
 
