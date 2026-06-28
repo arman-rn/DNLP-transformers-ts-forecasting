@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="schema.png" alt="Volatility-Aware Patch Adaptation Pipeline" width="100%">
+  <img src="pawoa.png" alt="Volatility-Aware Patch Adaptation Pipeline" width="100%">
 </p>
 
 # Adaptive Tokenization in Time Series Foundation Models via Volatility-Aware Patching
